@@ -1,0 +1,4 @@
+/target/
+/tests/fixtures/provider-unification/target/
+.claude/
+.idea/

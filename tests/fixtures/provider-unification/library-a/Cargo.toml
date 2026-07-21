@@ -1,0 +1,8 @@
+[package]
+name = "provider-library-a"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+fast-floe = { path = "../../../..", default-features = false, features = ["aws-lc-rs"] }

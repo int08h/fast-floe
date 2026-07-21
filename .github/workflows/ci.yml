@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  default-provider:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --all-targets
+      - run: cargo test --doc
+
+  single-provider:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        provider:
+          - aead-aws-lc-rs
+          - aead-boring
+          - aead-ring
+          - aead-rustcrypto
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --all-targets --no-default-features --features "${{ matrix.provider }}"
+
+  provider-pairs:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        providers:
+          - aead-aws-lc-rs,aead-boring
+          - aead-aws-lc-rs,aead-ring
+          - aead-aws-lc-rs,aead-rustcrypto
+          - aead-boring,aead-ring
+          - aead-boring,aead-rustcrypto
+          - aead-ring,aead-rustcrypto
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo check --all-targets --no-default-features --features "${{ matrix.providers }}"
+
+  all-providers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add clippy
+      - run: cargo test --all-targets --all-features
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  feature-unification:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --manifest-path tests/fixtures/provider-unification/Cargo.toml
