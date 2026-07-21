@@ -28,7 +28,7 @@ Add `fast-floe` from [crates.io](https://crates.io/crates/fast-floe) to
 
 ```toml
 [dependencies]
-fast-floe = "0.1"
+fast-floe = "0.3"
 ```
 
 aws-lc-rs is the default cryptographic provider, but can be overridden, 
