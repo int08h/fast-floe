@@ -21,10 +21,10 @@ jobs:
       fail-fast: false
       matrix:
         provider:
-          - aead-aws-lc-rs
-          - aead-boring
-          - aead-ring
-          - aead-rustcrypto
+          - aws-lc-rs
+          - boring
+          - ring
+          - rustcrypto
     steps:
       - uses: actions/checkout@v4
       - run: cargo test --all-targets --no-default-features --features "${{ matrix.provider }}"
@@ -35,12 +35,12 @@ jobs:
       fail-fast: false
       matrix:
         providers:
-          - aead-aws-lc-rs,aead-boring
-          - aead-aws-lc-rs,aead-ring
-          - aead-aws-lc-rs,aead-rustcrypto
-          - aead-boring,aead-ring
-          - aead-boring,aead-rustcrypto
-          - aead-ring,aead-rustcrypto
+          - aws-lc-rs,boring
+          - aws-lc-rs,ring
+          - aws-lc-rs,rustcrypto
+          - boring,ring
+          - boring,rustcrypto
+          - ring,rustcrypto
     steps:
       - uses: actions/checkout@v4
       - run: cargo check --all-targets --no-default-features --features "${{ matrix.providers }}"
