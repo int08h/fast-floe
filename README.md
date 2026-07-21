@@ -1,6 +1,7 @@
 # fast-floe
 
-The Fast Lightweight Online Encryption (FLOE) scheme for authenticated encryption of 
+An optimized, multi-provider, spec-complianct implementation of 
+the Fast Lightweight Online Encryption (FLOE) scheme for authenticated encryption of 
 large files and byte streams with bounded-memory and random access.
 
 ## Introduction
