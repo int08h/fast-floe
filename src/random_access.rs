@@ -245,11 +245,6 @@ impl<R: Read + Seek> Reader<R> {
             } else {
                 self.load_cached_segment(segment)?;
                 let plaintext = self.scratch.plaintext().map_err(decryption_error)?;
-                // The loop starts at `range.start / segment_length`, so this
-                // difference is below one segment length and fits in usize.
-                // The `.min(plaintext.len())` after the conversion is
-                // redundant given that bound; it stays as cheap defense in
-                // depth.
                 let local_start = usize::try_from(range.start.saturating_sub(segment_start))
                     .map_err(|_| length_overflow())?
                     .min(plaintext.len());
@@ -257,8 +252,7 @@ impl<R: Read + Seek> Reader<R> {
                     .end
                     .min(segment_start + length_usize_to_u64(plaintext.len()))
                     - segment_start;
-                // Bounded by `plaintext.len()`, which fits in usize by
-                // construction.
+                
                 let local_end = usize::try_from(local_end_u64).map_err(|_| length_overflow())?;
                 let chunk = &plaintext[local_start..local_end];
                 output[written..written + chunk.len()].copy_from_slice(chunk);
@@ -390,8 +384,6 @@ impl<R: Read + Seek> Read for Reader<R> {
         self.load_cached_segment(segment)?;
 
         let plaintext = self.scratch.plaintext().map_err(decryption_error)?;
-        // `position = plaintext_position / segment_length`, so this remainder
-        // is below one segment length and fits in usize.
         let local = usize::try_from(self.plaintext_position - segment.plaintext_offset())
             .map_err(|_| length_overflow())?;
         let read = output.len().min(plaintext.len() - local);
@@ -467,8 +459,6 @@ fn remaining_length(reader: &mut (impl Read + Seek), message_start: u64) -> io::
 fn validate_header_bound(ciphertext_length: u64) -> io::Result<()> {
     if ciphertext_length < HEADER_LENGTH_U64 {
         Err(decryption_error(Error::InvalidHeaderLength {
-            // On this branch `ciphertext_length < HEADER_LENGTH` (74), so the
-            // clamp can never engage.
             actual: usize::try_from(ciphertext_length).unwrap_or(usize::MAX),
         }))
     } else {

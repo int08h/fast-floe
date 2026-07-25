@@ -12,14 +12,14 @@ pub(crate) const ENCODED_PARAMETERS_LENGTH: usize = 10;
 pub(crate) const HEADER_TAG_LENGTH: usize = 32;
 pub(crate) const HEADER_LENGTH: usize =
     ENCODED_PARAMETERS_LENGTH + FLOE_IV_LENGTH + HEADER_TAG_LENGTH;
-const _: () = assert!(HEADER_LENGTH == 74, "unexpected size of HEADER");
 
-// Every length in this crate crosses between usize and the u32 wire format or
-// u64 message arithmetic. A 16-bit usize cannot represent SEGMENT_1_MIB and
-// would silently truncate attacker-controlled segment prefixes; a usize wider
-// than u64 would break the message-length conversions. Fail the build instead.
 const _: () = assert!(
-    usize::BITS >= 32 && usize::BITS <= 64,
+    HEADER_LENGTH == 74, 
+    "unexpected size of HEADER"
+);
+
+const _: () = assert!(
+    usize::BITS == 32 || usize::BITS == 64,
     "fast-floe supports only 32-bit and 64-bit targets"
 );
 
@@ -41,18 +41,13 @@ pub(crate) const SEGMENT_OVERHEAD_U32: u32 = 32;
 const _: () = assert!(length_u32_to_usize(SEGMENT_OVERHEAD_U32) == SEGMENT_OVERHEAD);
 
 /// Converts a wire-format length to the crate's in-memory length type.
-///
-/// Lossless on every supported target; see the `usize::BITS` assertion above.
 #[inline]
 pub(crate) const fn length_u32_to_usize(value: u32) -> usize {
     value as usize
 }
 
 /// Converts an in-memory length to the crate's message-arithmetic type.
-///
-/// Lossless on every supported target; see the `usize::BITS` assertion above.
-/// `std` provides no `From<usize> for u64`, so this documents the assumption
-/// once instead of at each call site.
+/// `std` has no `From<usize> for u64`, so this documents the assumption once. 
 #[inline]
 pub(crate) const fn length_usize_to_u64(value: usize) -> u64 {
     value as u64
@@ -181,10 +176,6 @@ impl MessageLayout {
         let (plaintext_length, ciphertext_length) = match kind {
             SegmentKind::NonFinal => (plaintext_segment_length, ciphertext_segment_length),
             SegmentKind::Final => {
-                // The final segment's remainder is at most one plaintext
-                // segment by the `segment_count` arithmetic, so this fits in
-                // usize; kept checked because the bound lives in the layout
-                // math rather than in a type.
                 let plaintext_length =
                     usize::try_from(self.plaintext_length - plaintext_offset).ok()?;
                 (plaintext_length, SEGMENT_OVERHEAD + plaintext_length)
@@ -495,11 +486,6 @@ impl Parameters {
         let body_length = ciphertext_length
             .checked_sub(HEADER_LENGTH_U64)
             .ok_or_else(|| {
-                // Constructed lazily, and that is load-bearing: built eagerly,
-                // the conversion would also run for valid lengths above 4 GiB,
-                // which exceed usize on 32-bit targets. On this branch
-                // `ciphertext_length < HEADER_LENGTH` (74), so the clamp can
-                // never engage.
                 Error::InvalidHeaderLength {
                     actual: usize::try_from(ciphertext_length).unwrap_or(usize::MAX),
                 }
@@ -522,8 +508,6 @@ impl Parameters {
 
         if final_length < SEGMENT_OVERHEAD_U64 {
             return Err(Error::InvalidCiphertextLength {
-                // On this branch `final_length < SEGMENT_OVERHEAD` (32), so
-                // the clamp can never engage.
                 actual: usize::try_from(final_length).unwrap_or(usize::MAX),
                 required: LengthRequirement::Between {
                     minimum: SEGMENT_OVERHEAD,

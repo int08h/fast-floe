@@ -359,10 +359,6 @@ fn encrypt_prepared_segment(
     let key = keys.key_for_position(context, position)?;
     let prefix = match kind {
         SegmentKind::NonFinal => u32::MAX,
-        // `ciphertext_segment_size` bounds `required` at
-        // `ciphertext_segment_length`, at most 1 MiB, so the conversion cannot
-        // fail. The same bound keeps an encoded final length from ever
-        // colliding with the `u32::MAX` non-final sentinel.
         SegmentKind::Final => u32::try_from(required).map_err(|_| Error::LengthOverflow)?,
     };
     output[..SEGMENT_PREFIX_LENGTH].copy_from_slice(&prefix.to_be_bytes());
@@ -418,8 +414,8 @@ fn validate_segment(
     );
 
     match kind {
-        // Compared in u64 space: the equality must not depend on the width of
-        // usize, because `prefix` is attacker-controlled and unauthenticated.
+        // `prefix` is attacker-controlled, usize might not be 64-bits, so
+        // promote everything to u64 for comparison
         SegmentKind::Final
             if u64::from(prefix) != length_usize_to_u64(ciphertext_segment.len()) =>
         {

@@ -515,12 +515,6 @@ fn segment_prefix_classification_exposes_valid_framing() {
 
 #[test]
 fn segment_framing_rejects_prefix_whose_low_bits_look_valid() {
-    // Characterization test for the 16-bit truncation class: these prefixes
-    // exceed the valid range, but their low 16 bits fall inside it. A decoder
-    // that narrowed the prefix before validating would accept them, so the
-    // range check must run in wire-format (u32) width. This passes on every
-    // supported target; it documents the property so a future refactor does
-    // not reintroduce a width-dependent check.
     let parameters = Parameters::SEGMENT_4_KIB;
     for forged in [69_632_u32, 1_048_576 + 4_096] {
         assert!(matches!(
@@ -532,10 +526,7 @@ fn segment_framing_rejects_prefix_whose_low_bits_look_valid() {
 
 #[test]
 fn final_segment_prefix_must_equal_actual_segment_length() {
-    // Characterization test: the forged prefix differs from the true segment
-    // length only in bits above the low 16, so a comparison narrowed to a
-    // 16-bit usize would pass it. The comparison must use the full wire-format
-    // width. This drives `decrypt_segment_at` directly because
+    // This drives `decrypt_segment_at` directly because
     // `SegmentFraming::decode` would reject the prefix before
     // `validate_segment` is exercised on the online path.
     let parameters = Parameters::SEGMENT_4_KIB;
@@ -554,7 +545,7 @@ fn final_segment_prefix_must_equal_actual_segment_length() {
     let error = decryption
         .decrypt_segment_at(&segment, 0, SegmentKind::Final)
         .unwrap_err();
-    // Rejected by prefix validation, before any authentication is attempted.
+
     assert!(matches!(
         error,
         Error::InvalidCiphertextLength {
