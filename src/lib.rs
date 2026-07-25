@@ -47,6 +47,7 @@ pub(crate) use buffer::SegmentBuffer;
 pub(crate) use parameters::{
     AEAD_IV_LENGTH, AEAD_MAX_SEGMENTS, AEAD_TAG_LENGTH, ENCODED_PARAMETERS_LENGTH, FLOE_IV_LENGTH,
     HEADER_LENGTH, HEADER_TAG_LENGTH, SEGMENT_OVERHEAD, SEGMENT_PAYLOAD_OFFSET, SegmentLayout,
+    length_u32_to_usize, length_usize_to_u64,
 };
 pub(crate) use state::{
     DecryptionState, EncryptionState, start_decryption, start_decryption_inferred, start_encryption,

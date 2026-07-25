@@ -14,6 +14,15 @@ pub(crate) const HEADER_LENGTH: usize =
     ENCODED_PARAMETERS_LENGTH + FLOE_IV_LENGTH + HEADER_TAG_LENGTH;
 const _: () = assert!(HEADER_LENGTH == 74, "unexpected size of HEADER");
 
+// Every length in this crate crosses between usize and the u32 wire format or
+// u64 message arithmetic. A 16-bit usize cannot represent SEGMENT_1_MIB and
+// would silently truncate attacker-controlled segment prefixes; a usize wider
+// than u64 would break the message-length conversions. Fail the build instead.
+const _: () = assert!(
+    usize::BITS >= 32 && usize::BITS <= 64,
+    "fast-floe supports only 32-bit and 64-bit targets"
+);
+
 /// Segment length prefix size in bytes.
 pub const SEGMENT_PREFIX_LENGTH: usize = 4;
 
@@ -26,6 +35,28 @@ pub(crate) const SEGMENT_OVERHEAD: usize = SEGMENT_PAYLOAD_OFFSET + AEAD_TAG_LEN
 
 const ROTATION_BITS: u8 = 20;
 const FLOE_IV_LENGTH_U32: u32 = 32;
+const _: () = assert!(length_u32_to_usize(FLOE_IV_LENGTH_U32) == FLOE_IV_LENGTH);
+
+pub(crate) const SEGMENT_OVERHEAD_U32: u32 = 32;
+const _: () = assert!(length_u32_to_usize(SEGMENT_OVERHEAD_U32) == SEGMENT_OVERHEAD);
+
+/// Converts a wire-format length to the crate's in-memory length type.
+///
+/// Lossless on every supported target; see the `usize::BITS` assertion above.
+#[inline]
+pub(crate) const fn length_u32_to_usize(value: u32) -> usize {
+    value as usize
+}
+
+/// Converts an in-memory length to the crate's message-arithmetic type.
+///
+/// Lossless on every supported target; see the `usize::BITS` assertion above.
+/// `std` provides no `From<usize> for u64`, so this documents the assumption
+/// once instead of at each call site.
+#[inline]
+pub(crate) const fn length_usize_to_u64(value: usize) -> u64 {
+    value as u64
+}
 
 /// A supported FLOE parameter set.
 ///
@@ -302,18 +333,20 @@ impl SegmentFraming {
         let ciphertext_length = if encoded == u32::MAX {
             parameters.ciphertext_segment_length()
         } else {
-            let length = encoded as usize;
-            let valid_range = SEGMENT_OVERHEAD..=parameters.ciphertext_segment_length();
-            if !valid_range.contains(&length) {
+            // Validated in u32 space: the range check must not depend on the
+            // width of usize, because `encoded` is attacker-controlled and
+            // unauthenticated.
+            let maximum = parameters.ciphertext_segment_length_u32();
+            if !(SEGMENT_OVERHEAD_U32..=maximum).contains(&encoded) {
                 return Err(Error::InvalidCiphertextLength {
-                    actual: length,
+                    actual: length_u32_to_usize(encoded),
                     required: LengthRequirement::Between {
                         minimum: SEGMENT_OVERHEAD,
                         maximum: parameters.ciphertext_segment_length(),
                     },
                 });
             }
-            length
+            length_u32_to_usize(encoded)
         };
 
         Ok(Self {
@@ -379,6 +412,10 @@ impl Parameters {
     #[inline]
     pub const fn ciphertext_segment_length(self) -> usize {
         self.ciphertext_segment_length as usize
+    }
+
+    pub(crate) const fn ciphertext_segment_length_u32(self) -> u32 {
+        self.ciphertext_segment_length
     }
 
     /// Returns the plaintext length of every non-final segment and the maximum
