@@ -1,6 +1,6 @@
 use core::iter::FusedIterator;
 use core::ops::Range;
-
+use std::ops::RangeInclusive;
 use crate::{Error, LengthRequirement, Result};
 
 pub(crate) const AEAD_IV_LENGTH: usize = 12;
@@ -56,9 +56,14 @@ pub(crate) const fn length_usize_to_u64(value: usize) -> u64 {
 pub(crate) const HEADER_LENGTH_U64: u64 = length_usize_to_u64(HEADER_LENGTH);
 pub(crate) const SEGMENT_OVERHEAD_U64: u64 = length_usize_to_u64(SEGMENT_OVERHEAD);
 
-/// A supported FLOE parameter set.
+/// The segment length is the only varying parameter in the current
+/// specification; AES-256-GCM, HKDF-Expand-SHA-384, and the 32-byte FLOE
+/// IV are fixed.
 ///
-/// See [`Self::SEGMENT_4_KIB`] or [`Self::SEGMENT_1_MIB`] for concrete instances.
+/// Use [`Parameters::with_length`] to construct a [`Parameters`] instance with
+/// your desired segment length, or use one of the pre-made [`Parameters`] constants
+/// like [`Parameters::SEGMENT_4_KIB`] or [`Parameters::SEGMENT_1_MIB`] if convenient.
+///
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Parameters {
     ciphertext_segment_length: u32,
@@ -385,26 +390,36 @@ impl SegmentFraming {
 }
 
 impl Parameters {
+    /// Range valid of FLOE segment sizes in bytes. FLOE accepts _any_ segment size
+    /// in this range and is not restricted to powers of 2.
+    pub const VALID_SEGMENT_LENGTHS: RangeInclusive<u32> = 64..=(u32::MAX - 2);
+
+    /// FLOE with 64-byte encrypted segments.
+    pub const SEGMENT_64_B: Self = Self {
+        ciphertext_segment_length: 64,
+    };
+
     /// FLOE with 4 KiB encrypted segments.
-    ///
-    /// The segment length is the only varying parameter in the current
-    /// specification; AES-256-GCM, HKDF-Expand-SHA-384, and the 32-byte FLOE
-    /// IV are fixed.
     pub const SEGMENT_4_KIB: Self = Self {
         ciphertext_segment_length: 4 * 1024,
     };
 
     /// FLOE with 1 MiB encrypted segments.
-    ///
-    /// The segment length is the only varying parameter in the current
-    /// specification; AES-256-GCM, HKDF-Expand-SHA-384, and the 32-byte FLOE
-    /// IV are fixed.
     pub const SEGMENT_1_MIB: Self = Self {
         ciphertext_segment_length: 1024 * 1024,
     };
 
-    /// Every parameter profile supported by this crate.
-    pub const ALL: [Self; 2] = [Self::SEGMENT_4_KIB, Self::SEGMENT_1_MIB];
+    /// Construct a [`Parameters`] instance with the provided segment length in bytes.
+    /// `segment_len` can be any value in the range [`Parameters::VALID_SEGMENT_LENGTHS`].
+    pub fn with_length(segment_len: u32) -> Result<Self> {
+        if !Self::VALID_SEGMENT_LENGTHS.contains(&segment_len) {
+            return Err(Error::InvalidParameters);
+        }
+
+        Ok(Self {
+            ciphertext_segment_length: segment_len,
+        })
+    }
 
     /// Returns the exact length of every non-final ciphertext segment.
     #[must_use]

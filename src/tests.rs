@@ -232,10 +232,6 @@ fn ambiguous_keys_fail_from_every_entry_layer() {
 #[test]
 fn parameter_encoding_matches_specification() {
     assert_eq!(
-        Parameters::ALL,
-        [Parameters::SEGMENT_4_KIB, Parameters::SEGMENT_1_MIB]
-    );
-    assert_eq!(
         Parameters::SEGMENT_4_KIB.encode(),
         hex::decode("00000000100000000020").unwrap().as_slice()
     );
