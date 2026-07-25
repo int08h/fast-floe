@@ -409,6 +409,26 @@ impl Parameters {
         ciphertext_segment_length: 1024 * 1024,
     };
 
+    /// FLOE with 4 MiB encrypted segments.
+    pub const SEGMENT_4_MIB: Self = Self {
+        ciphertext_segment_length: 4 * 1024 * 1024,
+    };
+
+    /// FLOE with 5 MiB encrypted segments.
+    pub const SEGMENT_5_MIB: Self = Self {
+        ciphertext_segment_length: 5 * 1024 * 1024,
+    };
+
+    /// FLOE with 8 MiB encrypted segments.
+    pub const SEGMENT_8_MIB: Self = Self {
+        ciphertext_segment_length: 8 * 1024 * 1024,
+    };
+
+    /// FLOE with 16 MiB encrypted segments.
+    pub const SEGMENT_16_MIB: Self = Self {
+        ciphertext_segment_length: 16 * 1024 * 1024,
+    };
+
     /// Construct a [`Parameters`] instance with the provided segment length in bytes.
     /// `segment_len` can be any value in the range [`Parameters::VALID_SEGMENT_LENGTHS`].
     pub fn with_length(segment_len: u32) -> Result<Self> {
