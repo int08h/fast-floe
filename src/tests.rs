@@ -514,6 +514,48 @@ fn segment_prefix_classification_exposes_valid_framing() {
 }
 
 #[test]
+fn segment_framing_rejects_prefix_whose_low_bits_look_valid() {
+    let parameters = Parameters::SEGMENT_4_KIB;
+    for forged in [69_632_u32, 1_048_576 + 4_096] {
+        assert!(matches!(
+            SegmentFraming::decode(parameters, forged.to_be_bytes()),
+            Err(Error::InvalidCiphertextLength { .. })
+        ));
+    }
+}
+
+#[test]
+fn final_segment_prefix_must_equal_actual_segment_length() {
+    // This drives `decrypt_segment_at` directly because
+    // `SegmentFraming::decode` would reject the prefix before
+    // `validate_segment` is exercised on the online path.
+    let parameters = Parameters::SEGMENT_4_KIB;
+    let (mut encryption, header) =
+        start_encryption(&KEY, b"forged final prefix", parameters).unwrap();
+    let layout = parameters.plaintext_layout(4).unwrap();
+    let mut segment = encryption
+        .encrypt_segment(b"last", layout.final_segment())
+        .unwrap();
+    let true_length = u32::try_from(segment.len()).unwrap();
+    let forged = true_length | 0x0001_0000;
+    segment[..crate::SEGMENT_PREFIX_LENGTH].copy_from_slice(&forged.to_be_bytes());
+
+    let mut decryption =
+        start_decryption(&KEY, b"forged final prefix", parameters, &header).unwrap();
+    let error = decryption
+        .decrypt_segment_at(&segment, 0, SegmentKind::Final)
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        Error::InvalidCiphertextLength {
+            actual,
+            required: LengthRequirement::Exactly(required),
+        } if actual == segment.len() && required == segment.len() + 0x1_0000
+    ));
+}
+
+#[test]
 fn complete_message_round_trips_boundaries() {
     let parameters = Parameters::SEGMENT_4_KIB;
     let segment_length = parameters.plaintext_segment_length();

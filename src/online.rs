@@ -15,7 +15,7 @@ pub use crate::buffer::SegmentBuffer;
 use crate::wire::split_header;
 use crate::{
     AEAD_MAX_SEGMENTS, DecryptionState, EncryptionState, Error, Header, Key, LengthRequirement,
-    Parameters, Result, SEGMENT_PREFIX_LENGTH, SegmentKind, start_decryption,
+    Parameters, Result, SEGMENT_PREFIX_LENGTH, SegmentKind, length_usize_to_u64, start_decryption,
     start_decryption_inferred, start_encryption,
 };
 
@@ -514,7 +514,7 @@ pub fn encrypt(key: &Key, aad: &[u8], parameters: Parameters, plaintext: &[u8]) 
 }
 
 fn encrypt_body(encryptor: Encryptor, plaintext: &[u8]) -> Result<Vec<u8>> {
-    let plaintext_length = u64::try_from(plaintext.len()).map_err(|_| Error::LengthOverflow)?;
+    let plaintext_length = length_usize_to_u64(plaintext.len());
     let parameters = encryptor.parameters();
     let layout = parameters.plaintext_layout(plaintext_length)?;
     let capacity =

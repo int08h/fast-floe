@@ -12,7 +12,8 @@ use std::io::{self, Read, Seek, SeekFrom};
 pub use crate::parameters::{MessageLayout, SegmentLayout, Segments};
 use crate::wire::{decryption_error, length_overflow, read_exact_segment, read_header};
 use crate::{
-    DecryptionState, Error, Header, Key, Parameters, SegmentBuffer, start_decryption_inferred,
+    DecryptionState, Error, HEADER_LENGTH_U64, Header, Key, Parameters, SegmentBuffer,
+    length_usize_to_u64, start_decryption_inferred,
 };
 
 /// Authenticated random-access reader for a complete seekable FLOE ciphertext.
@@ -222,8 +223,7 @@ impl<R: Read + Seek> Reader<R> {
             return Ok(0);
         }
 
-        let segment_length = u64::try_from(self.parameters().plaintext_segment_length())
-            .map_err(|_| length_overflow())?;
+        let segment_length = u64::from(self.parameters().plaintext_segment_length_u32());
         let first = range.start / segment_length;
         let last = (range.end - 1) / segment_length;
         let mut written = 0;
@@ -231,8 +231,7 @@ impl<R: Read + Seek> Reader<R> {
         for position in first..=last {
             let segment = self.segment(position)?;
             let segment_start = segment.plaintext_offset();
-            let segment_plaintext_length =
-                u64::try_from(segment.plaintext_length()).map_err(|_| length_overflow())?;
+            let segment_plaintext_length = length_usize_to_u64(segment.plaintext_length());
 
             let is_covered_fully = range.start <= segment_start
                 && segment_start + segment_plaintext_length <= range.end;
@@ -249,10 +248,11 @@ impl<R: Read + Seek> Reader<R> {
                 let local_start = usize::try_from(range.start.saturating_sub(segment_start))
                     .map_err(|_| length_overflow())?
                     .min(plaintext.len());
-                let local_end_u64 = range.end.min(
-                    segment_start
-                        + u64::try_from(plaintext.len()).map_err(|_| length_overflow())?,
-                ) - segment_start;
+                let local_end_u64 = range
+                    .end
+                    .min(segment_start + length_usize_to_u64(plaintext.len()))
+                    - segment_start;
+                
                 let local_end = usize::try_from(local_end_u64).map_err(|_| length_overflow())?;
                 let chunk = &plaintext[local_start..local_end];
                 output[written..written + chunk.len()].copy_from_slice(chunk);
@@ -260,10 +260,7 @@ impl<R: Read + Seek> Reader<R> {
             }
         }
 
-        debug_assert_eq!(
-            u64::try_from(written).unwrap_or(u64::MAX),
-            range.end - range.start
-        );
+        debug_assert_eq!(length_usize_to_u64(written), range.end - range.start);
         Ok(written)
     }
 
@@ -357,11 +354,9 @@ impl<R: Read + Seek> Reader<R> {
     }
 
     fn seek_to_body_start(&mut self) -> io::Result<()> {
-        let header_length = u64::try_from(Header::LEN).map_err(|_| length_overflow())?;
-
         self.inner.seek(SeekFrom::Start(
             self.message_start
-                .checked_add(header_length)
+                .checked_add(HEADER_LENGTH_U64)
                 .ok_or_else(length_overflow)?,
         ))?;
 
@@ -383,8 +378,7 @@ impl<R: Read + Seek> Read for Reader<R> {
             return Ok(0);
         }
 
-        let segment_length = u64::try_from(self.parameters().plaintext_segment_length())
-            .map_err(|_| length_overflow())?;
+        let segment_length = u64::from(self.parameters().plaintext_segment_length_u32());
         let position = self.plaintext_position / segment_length;
         let segment = self.segment(position)?;
         self.load_cached_segment(segment)?;
@@ -394,7 +388,7 @@ impl<R: Read + Seek> Read for Reader<R> {
             .map_err(|_| length_overflow())?;
         let read = output.len().min(plaintext.len() - local);
         output[..read].copy_from_slice(&plaintext[local..local + read]);
-        self.plaintext_position += u64::try_from(read).map_err(|_| length_overflow())?;
+        self.plaintext_position += length_usize_to_u64(read);
         Ok(read)
     }
 }
@@ -463,8 +457,7 @@ fn remaining_length(reader: &mut (impl Read + Seek), message_start: u64) -> io::
 }
 
 fn validate_header_bound(ciphertext_length: u64) -> io::Result<()> {
-    let header_length = u64::try_from(Header::LEN).map_err(|_| length_overflow())?;
-    if ciphertext_length < header_length {
+    if ciphertext_length < HEADER_LENGTH_U64 {
         Err(decryption_error(Error::InvalidHeaderLength {
             actual: usize::try_from(ciphertext_length).unwrap_or(usize::MAX),
         }))

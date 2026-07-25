@@ -8,7 +8,7 @@ use crate::{
     AEAD_IV_LENGTH, AEAD_MAX_SEGMENTS, AEAD_TAG_LENGTH, ENCODED_PARAMETERS_LENGTH, Error,
     FLOE_IV_LENGTH, HEADER_LENGTH, HEADER_TAG_LENGTH, Key, LengthRequirement, Parameters, Provider,
     Result, SEGMENT_OVERHEAD, SEGMENT_PAYLOAD_OFFSET, SEGMENT_PREFIX_LENGTH, SegmentBuffer,
-    SegmentFraming, SegmentKind, SegmentLayout,
+    SegmentFraming, SegmentKind, SegmentLayout, length_u32_to_usize, length_usize_to_u64,
 };
 
 const HEADER_TAG_PURPOSE: &[u8] = b"HEADER_TAG:";
@@ -414,10 +414,14 @@ fn validate_segment(
     );
 
     match kind {
-        SegmentKind::Final if prefix as usize != ciphertext_segment.len() => {
+        // `prefix` is attacker-controlled, usize might not be 64-bits, so
+        // promote everything to u64 for comparison
+        SegmentKind::Final
+            if u64::from(prefix) != length_usize_to_u64(ciphertext_segment.len()) =>
+        {
             return Err(Error::InvalidCiphertextLength {
                 actual: ciphertext_segment.len(),
-                required: LengthRequirement::Exactly(prefix as usize),
+                required: LengthRequirement::Exactly(length_u32_to_usize(prefix)),
             });
         }
         SegmentKind::NonFinal if prefix != u32::MAX => {
