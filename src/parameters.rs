@@ -58,6 +58,9 @@ pub(crate) const fn length_usize_to_u64(value: usize) -> u64 {
     value as u64
 }
 
+pub(crate) const HEADER_LENGTH_U64: u64 = length_usize_to_u64(HEADER_LENGTH);
+pub(crate) const SEGMENT_OVERHEAD_U64: u64 = length_usize_to_u64(SEGMENT_OVERHEAD);
+
 /// A supported FLOE parameter set.
 ///
 /// See [`Self::SEGMENT_4_KIB`] or [`Self::SEGMENT_1_MIB`] for concrete instances.
@@ -163,9 +166,11 @@ impl MessageLayout {
         }
 
         let plaintext_segment_length = self.parameters.plaintext_segment_length();
-        let plaintext_segment_length_u64 = u64::try_from(plaintext_segment_length).ok()?;
+        let plaintext_segment_length_u64 =
+            u64::from(self.parameters.plaintext_segment_length_u32());
         let ciphertext_segment_length = self.parameters.ciphertext_segment_length();
-        let ciphertext_segment_length_u64 = u64::try_from(ciphertext_segment_length).ok()?;
+        let ciphertext_segment_length_u64 =
+            u64::from(self.parameters.ciphertext_segment_length_u32());
         let plaintext_offset = position * plaintext_segment_length_u64;
         let kind = if position + 1 == self.segment_count {
             SegmentKind::Final
@@ -182,8 +187,7 @@ impl MessageLayout {
             }
         };
 
-        let ciphertext_offset =
-            u64::try_from(HEADER_LENGTH).ok()? + position * ciphertext_segment_length_u64;
+        let ciphertext_offset = HEADER_LENGTH_U64 + position * ciphertext_segment_length_u64;
 
         Some(SegmentLayout {
             parameters: self.parameters,
@@ -411,7 +415,7 @@ impl Parameters {
     #[must_use]
     #[inline]
     pub const fn ciphertext_segment_length(self) -> usize {
-        self.ciphertext_segment_length as usize
+        length_u32_to_usize(self.ciphertext_segment_length)
     }
 
     pub(crate) const fn ciphertext_segment_length_u32(self) -> u32 {
@@ -423,7 +427,11 @@ impl Parameters {
     #[must_use]
     #[inline]
     pub const fn plaintext_segment_length(self) -> usize {
-        self.ciphertext_segment_length() - SEGMENT_OVERHEAD
+        length_u32_to_usize(self.plaintext_segment_length_u32())
+    }
+
+    pub(crate) const fn plaintext_segment_length_u32(self) -> u32 {
+        self.ciphertext_segment_length - SEGMENT_OVERHEAD_U32
     }
 
     /// Calculates the complete FLOE layout for `plaintext_length`.
@@ -438,8 +446,7 @@ impl Parameters {
     /// specification's segment limit, or [`Error::LengthOverflow`] when the
     /// resulting ciphertext length cannot be represented as a `u64`.
     pub fn plaintext_layout(self, plaintext_length: u64) -> Result<MessageLayout> {
-        let plaintext_segment_length =
-            u64::try_from(self.plaintext_segment_length()).map_err(|_| Error::LengthOverflow)?;
+        let plaintext_segment_length = u64::from(self.plaintext_segment_length_u32());
 
         let segment_count = if plaintext_length == 0 {
             1
@@ -452,11 +459,10 @@ impl Parameters {
         }
 
         let framing_length = segment_count
-            .checked_mul(u64::try_from(SEGMENT_OVERHEAD).map_err(|_| Error::LengthOverflow)?)
+            .checked_mul(SEGMENT_OVERHEAD_U64)
             .ok_or(Error::LengthOverflow)?;
 
-        let ciphertext_length = u64::try_from(HEADER_LENGTH)
-            .map_err(|_| Error::LengthOverflow)?
+        let ciphertext_length = HEADER_LENGTH_U64
             .checked_add(plaintext_length)
             .and_then(|length| length.checked_add(framing_length))
             .ok_or(Error::LengthOverflow)?;
@@ -482,10 +488,9 @@ impl Parameters {
     /// Returns an error when the ciphertext is too short, implies an invalid
     /// final segment length, or exceeds the specification's segment limit.
     pub fn ciphertext_layout(self, ciphertext_length: u64) -> Result<MessageLayout> {
-        let header_length = u64::try_from(HEADER_LENGTH).map_err(|_| Error::LengthOverflow)?;
         let body_length =
             ciphertext_length
-                .checked_sub(header_length)
+                .checked_sub(HEADER_LENGTH_U64)
                 .ok_or(Error::InvalidHeaderLength {
                     actual: usize::try_from(ciphertext_length).unwrap_or(usize::MAX),
                 })?;
@@ -494,8 +499,7 @@ impl Parameters {
             return Err(Error::Truncated);
         }
 
-        let ciphertext_segment_length =
-            u64::try_from(self.ciphertext_segment_length()).map_err(|_| Error::LengthOverflow)?;
+        let ciphertext_segment_length = u64::from(self.ciphertext_segment_length_u32());
 
         let segment_count = (body_length - 1) / ciphertext_segment_length + 1;
 
@@ -505,9 +509,8 @@ impl Parameters {
 
         let preceding_length = (segment_count - 1) * ciphertext_segment_length;
         let final_length = body_length - preceding_length;
-        let minimum = u64::try_from(SEGMENT_OVERHEAD).map_err(|_| Error::LengthOverflow)?;
 
-        if final_length < minimum {
+        if final_length < SEGMENT_OVERHEAD_U64 {
             return Err(Error::InvalidCiphertextLength {
                 actual: usize::try_from(final_length).unwrap_or(usize::MAX),
                 required: LengthRequirement::Between {
@@ -518,7 +521,7 @@ impl Parameters {
         }
 
         let framing_length = segment_count
-            .checked_mul(minimum)
+            .checked_mul(SEGMENT_OVERHEAD_U64)
             .ok_or(Error::LengthOverflow)?;
 
         let plaintext_length = body_length
