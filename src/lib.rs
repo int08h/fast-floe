@@ -20,9 +20,10 @@ pub use parameters::{Parameters, SEGMENT_PREFIX_LENGTH, SegmentFraming, SegmentK
 pub use provider::Provider;
 pub use state::Header;
 
-/// Framing, backend, and raw random-access primitives for experts. These
-/// APIs expose more of the FLOE state machine and require callers to preserve
-/// message-level invariants (and to know those invariants exist).
+/// Framing, backend, and raw random-access primitives for experts.
+///
+/// These APIs expose more of the FLOE state machine and require callers
+/// to preserve message-level invariants (and to know those invariants exist).
 ///
 /// In particular, callers processing segments themselves must uphold the
 /// obligations that higher-level APIs abstract away:
