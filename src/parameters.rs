@@ -181,6 +181,10 @@ impl MessageLayout {
         let (plaintext_length, ciphertext_length) = match kind {
             SegmentKind::NonFinal => (plaintext_segment_length, ciphertext_segment_length),
             SegmentKind::Final => {
+                // The final segment's remainder is at most one plaintext
+                // segment by the `segment_count` arithmetic, so this fits in
+                // usize; kept checked because the bound lives in the layout
+                // math rather than in a type.
                 let plaintext_length =
                     usize::try_from(self.plaintext_length - plaintext_offset).ok()?;
                 (plaintext_length, SEGMENT_OVERHEAD + plaintext_length)
@@ -488,12 +492,18 @@ impl Parameters {
     /// Returns an error when the ciphertext is too short, implies an invalid
     /// final segment length, or exceeds the specification's segment limit.
     pub fn ciphertext_layout(self, ciphertext_length: u64) -> Result<MessageLayout> {
-        let body_length =
-            ciphertext_length
-                .checked_sub(HEADER_LENGTH_U64)
-                .ok_or(Error::InvalidHeaderLength {
+        let body_length = ciphertext_length
+            .checked_sub(HEADER_LENGTH_U64)
+            .ok_or_else(|| {
+                // Constructed lazily, and that is load-bearing: built eagerly,
+                // the conversion would also run for valid lengths above 4 GiB,
+                // which exceed usize on 32-bit targets. On this branch
+                // `ciphertext_length < HEADER_LENGTH` (74), so the clamp can
+                // never engage.
+                Error::InvalidHeaderLength {
                     actual: usize::try_from(ciphertext_length).unwrap_or(usize::MAX),
-                })?;
+                }
+            })?;
 
         if body_length == 0 {
             return Err(Error::Truncated);
@@ -512,6 +522,8 @@ impl Parameters {
 
         if final_length < SEGMENT_OVERHEAD_U64 {
             return Err(Error::InvalidCiphertextLength {
+                // On this branch `final_length < SEGMENT_OVERHEAD` (32), so
+                // the clamp can never engage.
                 actual: usize::try_from(final_length).unwrap_or(usize::MAX),
                 required: LengthRequirement::Between {
                     minimum: SEGMENT_OVERHEAD,

@@ -524,6 +524,9 @@ fn encrypt_body(encryptor: Encryptor, plaintext: &[u8]) -> Result<Vec<u8>> {
     let mut encryptor = Some(encryptor);
 
     for segment in layout.segments() {
+        // The offset indexes `plaintext`, a slice already in memory, so it
+        // fits in usize; kept checked because the bound lives in the layout
+        // math rather than in a type.
         let plaintext_start =
             usize::try_from(segment.plaintext_offset()).map_err(|_| Error::LengthOverflow)?;
         let plaintext_end = plaintext_start
