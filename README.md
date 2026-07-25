@@ -355,9 +355,29 @@ Run all provider and segment-size benchmarks with:
 
 ### Benchmark results
 
-Median throughput in GiB/s on an Apple M3 with each provider compiled as the 
-sole provider. The "into" columns write to a separate output buffer while
-"in place" overwrite their input buffer.
+Median throughput in GiB/s with each provider compiled solo with `-C target-cpu=native`.
+
+The "into" columns write to a separate output buffer (using scatter/gather if supported by the provider)
+while "in place" overwrite their input buffer.
+
+#### AMD Zen 5 9950X (VAES, AVX-512), Rust 1.97.1
+
+In GiB/sec, higher is better
+
+| Provider     | Segments | Encrypt into | Encrypt in place | Decrypt into | Decrypt in place |
+|--------------|----------|-------------:|-----------------:|-------------:|-----------------:|
+| `aws-lc-rs`  | 1 MiB    |         9.29 |            13.12 |        14.10 |            16.93 |
+| `boring`     | 1 MiB    |         8.90 |            17.47 |         9.35 |            17.70 |
+| `ring`       | 1 MiB    |         6.59 |            11.90 |         6.90 |            12.51 |
+| `rustcrypto` | 1 MiB    |         3.70 |             4.64 |         4.65 |             4.77 |
+| `aws-lc-rs`  | 4 KiB    |         7.16 |            11.23 |         9.34 |            12.70 |
+| `boring`     | 4 KiB    |         7.50 |            14.77 |         7.91 |            16.73 |
+| `ring`       | 4 KiB    |         6.33 |             9.81 |         7.05 |            10.58 |
+| `rustcrypto` | 4 KiB    |         3.53 |             4.45 |         4.17 |             4.22 |
+
+#### Apple M3, Rust 1.97.1
+
+In GiB/sec, higher is better
 
 | Provider     | Segments | Encrypt into | Encrypt in place | Decrypt into | Decrypt in place |
 |--------------|----------|-------------:|-----------------:|-------------:|-----------------:|

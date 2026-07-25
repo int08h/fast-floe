@@ -1,29 +1,45 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{
+    BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
+};
 use fast_floe::low_level::SegmentBuffer;
 use fast_floe::online::{Decryptor, Encryptor, FinalEncryptError};
 use fast_floe::random_access::MessageLayout;
 use fast_floe::{Header, Key, Parameters, Provider, SegmentKind, encrypt};
 
 const AAD: &[u8] = b"benchmark";
+const KIB: usize = 1024;
 const MIB: usize = 1024 * 1024;
 
+/// multipliers applied to last-level cache size so each
+/// case hits main memory instead staying in the cache
+const SMALL_SEGMENT_LLC_MULTIPLE: usize = 4;
+const LARGE_SEGMENT_LLC_MULTIPLE: usize = 16;
+
+/// Fallback message sizes if last-level cache cannot be detected.
+const DEFAULT_SMALL_SEGMENT_TARGET: usize = 4 * MIB;
+const DEFAULT_LARGE_SEGMENT_TARGET: usize = 64 * MIB;
+
 fn benchmark_backend_matrix(criterion: &mut Criterion) {
+    let (small_target, large_target) = target_lengths();
+    let cases = [
+        (
+            format!("4KiB-segments_{}-target", format_size(small_target)),
+            Parameters::SEGMENT_4_KIB,
+            small_target,
+        ),
+        (
+            format!("1MiB-segments_{}-target", format_size(large_target)),
+            Parameters::SEGMENT_1_MIB,
+            large_target,
+        ),
+    ];
     for &provider in Provider::COMPILED {
         let key = Key::from_bytes_with_provider([0x42; Key::LEN], provider);
-        for (case_name, parameters, target_length) in [
-            (
-                "4KiB-segments_4MiB-target",
-                Parameters::SEGMENT_4_KIB,
-                4 * MIB,
-            ),
-            (
-                "1MiB-segments_64MiB-target",
-                Parameters::SEGMENT_1_MIB,
-                64 * MIB,
-            ),
-        ] {
+        for (case_name, parameters, target_length) in &cases {
+            let (case_name, parameters, target_length) =
+                (case_name.as_str(), *parameters, *target_length);
             let plaintext = vec![0x5a; target_length];
             let layout = parameters
                 .plaintext_layout(
@@ -66,6 +82,7 @@ fn benchmark_encryption(
     ];
 
     let mut into_group = criterion.benchmark_group("encrypt_complete_into");
+    into_group.sampling_mode(SamplingMode::Flat);
     into_group.throughput(Throughput::Bytes(plaintext.len() as u64));
     into_group.bench_function(benchmark_id(), |bencher| {
         bencher.iter(|| {
@@ -81,15 +98,24 @@ fn benchmark_encryption(
     into_group.finish();
 
     let mut in_place_group = criterion.benchmark_group("encrypt_complete_in_place");
+    in_place_group.sampling_mode(SamplingMode::Flat);
     in_place_group.throughput(Throughput::Bytes(plaintext.len() as u64));
+    // Buffers are allocated once and refilled between iterations. Criterion's
+    // warm-up estimate counts untimed setup wall-clock, so per-iteration
+    // allocation of LLC-multiple working sets would trip its sample-count
+    // warning even though setup is excluded from the measurement.
+    let mut buffers = segment_buffers(parameters, layout);
     in_place_group.bench_function(benchmark_id(), |bencher| {
-        bencher.iter_batched_ref(
-            || plaintext_buffers(parameters, plaintext, layout),
-            |buffers| {
-                std::hint::black_box(encrypt_complete_in_place(key, parameters, buffers));
-            },
-            BatchSize::NumIterations(1),
-        );
+        bencher.iter_custom(|iterations| {
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..iterations {
+                refill_plaintext(&mut buffers, plaintext, layout);
+                let start = Instant::now();
+                std::hint::black_box(encrypt_complete_in_place(key, parameters, &mut buffers));
+                elapsed += start.elapsed();
+            }
+            elapsed
+        });
     });
     in_place_group.finish();
 }
@@ -109,6 +135,7 @@ fn benchmark_decryption(
     let mut plaintext_output = vec![0; plaintext_length];
 
     let mut into_group = criterion.benchmark_group("decrypt_complete_into");
+    into_group.sampling_mode(SamplingMode::Flat);
     into_group.throughput(Throughput::Bytes(plaintext_length as u64));
     into_group.bench_function(benchmark_id(), |bencher| {
         bencher.iter(|| {
@@ -123,15 +150,21 @@ fn benchmark_decryption(
     into_group.finish();
 
     let mut in_place_group = criterion.benchmark_group("decrypt_complete_in_place");
+    in_place_group.sampling_mode(SamplingMode::Flat);
     in_place_group.throughput(Throughput::Bytes(plaintext_length as u64));
+    // See encrypt_complete_in_place for why buffers are refilled, not rebuilt.
+    let mut buffers = segment_buffers(parameters, layout);
     in_place_group.bench_function(benchmark_id(), |bencher| {
-        bencher.iter_batched_ref(
-            || ciphertext_buffers(parameters, ciphertext, layout),
-            |buffers| {
-                std::hint::black_box(decrypt_complete_in_place(key, ciphertext, buffers));
-            },
-            BatchSize::NumIterations(1),
-        );
+        bencher.iter_custom(|iterations| {
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..iterations {
+                refill_ciphertext(&mut buffers, ciphertext, layout);
+                let start = Instant::now();
+                std::hint::black_box(decrypt_complete_in_place(key, ciphertext, &mut buffers));
+                elapsed += start.elapsed();
+            }
+            elapsed
+        });
     });
     in_place_group.finish();
 }
@@ -254,51 +287,160 @@ fn decrypt_complete_in_place(key: &Key, ciphertext: &[u8], buffers: &mut [Segmen
     written
 }
 
-fn plaintext_buffers(
-    parameters: Parameters,
-    plaintext: &[u8],
-    layout: MessageLayout,
-) -> Vec<SegmentBuffer> {
+fn segment_buffers(parameters: Parameters, layout: MessageLayout) -> Vec<SegmentBuffer> {
     layout
         .into_iter()
-        .map(|segment| {
-            let start = usize::try_from(segment.plaintext_offset()).expect("offset fits in usize");
-            let end = start + segment.plaintext_length();
-            let mut buffer = SegmentBuffer::new(parameters);
-            buffer
-                .prepare_plaintext(segment.plaintext_length())
-                .expect("valid plaintext length")
-                .copy_from_slice(&plaintext[start..end]);
-            buffer
-        })
+        .map(|_| SegmentBuffer::new(parameters))
         .collect()
 }
 
-fn ciphertext_buffers(
-    parameters: Parameters,
-    ciphertext: &[u8],
-    layout: MessageLayout,
-) -> Vec<SegmentBuffer> {
-    layout
-        .into_iter()
-        .map(|segment| {
-            let start = usize::try_from(segment.ciphertext_offset()).expect("offset fits in usize");
-            let end = start + segment.ciphertext_length();
-            let mut buffer = SegmentBuffer::new(parameters);
-            buffer
-                .prepare_ciphertext(segment.ciphertext_length())
-                .expect("valid encrypted length")
-                .copy_from_slice(&ciphertext[start..end]);
-            buffer
-        })
-        .collect()
+fn refill_plaintext(buffers: &mut [SegmentBuffer], plaintext: &[u8], layout: MessageLayout) {
+    for (buffer, segment) in buffers.iter_mut().zip(layout) {
+        let start = usize::try_from(segment.plaintext_offset()).expect("offset fits in usize");
+        let end = start + segment.plaintext_length();
+        buffer
+            .prepare_plaintext(segment.plaintext_length())
+            .expect("valid plaintext length")
+            .copy_from_slice(&plaintext[start..end]);
+    }
+}
+
+fn refill_ciphertext(buffers: &mut [SegmentBuffer], ciphertext: &[u8], layout: MessageLayout) {
+    for (buffer, segment) in buffers.iter_mut().zip(layout) {
+        let start = usize::try_from(segment.ciphertext_offset()).expect("offset fits in usize");
+        let end = start + segment.ciphertext_length();
+        buffer
+            .prepare_ciphertext(segment.ciphertext_length())
+            .expect("valid encrypted length")
+            .copy_from_slice(&ciphertext[start..end]);
+    }
+}
+
+/// Pick per-case message lengths from the detected last-level cache size so
+/// the benchmark measures main-memory throughput rather than cache residency.
+fn target_lengths() -> (usize, usize) {
+    if let Some(llc) = last_level_cache_size() {
+        let small = llc * SMALL_SEGMENT_LLC_MULTIPLE;
+        let large = llc * LARGE_SEGMENT_LLC_MULTIPLE;
+        eprintln!(
+            "detected {} last-level cache; message targets: {} (4KiB segments), {} (1MiB segments)",
+            format_size(llc),
+            format_size(small),
+            format_size(large),
+        );
+        (small, large)
+    } else {
+        eprintln!(
+            "unable to detect last-level cache size; using default message targets: {} and {}",
+            format_size(DEFAULT_SMALL_SEGMENT_TARGET),
+            format_size(DEFAULT_LARGE_SEGMENT_TARGET),
+        );
+        (DEFAULT_SMALL_SEGMENT_TARGET, DEFAULT_LARGE_SEGMENT_TARGET)
+    }
+}
+
+fn format_size(bytes: usize) -> String {
+    if bytes.is_multiple_of(MIB) {
+        format!("{}MiB", bytes / MIB)
+    } else if bytes.is_multiple_of(KIB) {
+        format!("{}KiB", bytes / KIB)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
+/// Largest data or unified cache reported by sysfs for cpu0. On multi-die
+/// parts this is one die's share of the total, which still bounds the
+/// working set a single benchmark thread can keep resident.
+#[cfg(target_os = "linux")]
+fn last_level_cache_size() -> Option<usize> {
+    let entries = std::fs::read_dir("/sys/devices/system/cpu/cpu0/cache").ok()?;
+    let mut last_level: Option<(u32, usize)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kind) = std::fs::read_to_string(path.join("type")) else {
+            continue;
+        };
+        if kind.trim() == "Instruction" {
+            continue;
+        }
+        let Some(level) = std::fs::read_to_string(path.join("level"))
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Some(size) = std::fs::read_to_string(path.join("size"))
+            .ok()
+            .as_deref()
+            .and_then(parse_cache_size)
+        else {
+            continue;
+        };
+        if last_level.is_none_or(|(best_level, _)| level > best_level) {
+            last_level = Some((level, size));
+        }
+    }
+    last_level.map(|(_, size)| size)
+}
+
+/// Parses sysfs cache sizes such as `32768K`.
+#[cfg(target_os = "linux")]
+fn parse_cache_size(text: &str) -> Option<usize> {
+    let text = text.trim();
+    let (digits, multiplier) = match text.as_bytes().last()? {
+        b'K' => (&text[..text.len() - 1], KIB),
+        b'M' => (&text[..text.len() - 1], MIB),
+        _ => (text, 1),
+    };
+    let value = digits.parse::<usize>().ok()?;
+    Some(value * multiplier)
+}
+
+/// Intel Macs report an L3; Apple Silicon has no L3, so the
+/// performance cores' shared L2 is the last-level cache.
+#[cfg(target_os = "macos")]
+fn last_level_cache_size() -> Option<usize> {
+    [
+        "hw.l3cachesize",
+        "hw.perflevel0.l2cachesize",
+        "hw.l2cachesize",
+    ]
+    .into_iter()
+    .find_map(sysctl_size)
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_size(name: &str) -> Option<usize> {
+    let output = std::process::Command::new("sysctl")
+        .args(["-n", name])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout)
+        .ok()?
+        .trim()
+        .parse::<usize>()
+        .ok()?;
+    (value > 0).then_some(value)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn last_level_cache_size() -> Option<usize> {
+    None
 }
 
 criterion_group! {
     name = benches;
+    // 10 samples (the Criterion minimum) keeps sample_size * iteration_time
+    // within the 3s measurement window even for the slowest provider at the
+    // 16x-LLC message size, so Criterion does not warn about sample counts.
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(3));
+        .measurement_time(Duration::from_secs(3))
+        .sample_size(10);
     targets = benchmark_backend_matrix
 }
 criterion_main!(benches);
