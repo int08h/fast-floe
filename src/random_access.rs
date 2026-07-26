@@ -471,11 +471,12 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+    use crate::key::test_key;
     use crate::{Parameters, encrypt};
 
     #[test]
     fn reads_segment_ranges_without_decrypting_complete_message() {
-        let key = Key::from_bytes_with_provider([0x33; Key::LEN], crate::Provider::COMPILED[0]);
+        let key = test_key();
         let parameters = Parameters::SEGMENT_4_KIB;
         let plaintext: Vec<u8> = (0..2 * parameters.plaintext_segment_length() + 37)
             .map(|position| u8::try_from(position % 251).unwrap())
@@ -532,7 +533,7 @@ mod tests {
 
     #[test]
     fn read_and_seek_provide_authenticated_plaintext_view() {
-        let key = Key::from_bytes_with_provider([0x37; Key::LEN], crate::Provider::COMPILED[0]);
+        let key = test_key();
         let parameters = Parameters::SEGMENT_4_KIB;
         let segment_length = parameters.plaintext_segment_length();
         let plaintext: Vec<u8> = (0..2 * segment_length + 23)
@@ -578,7 +579,7 @@ mod tests {
     #[test]
     #[allow(clippy::reversed_empty_ranges)] // deliberately invalid range input
     fn rejects_invalid_ranges_and_supports_a_parameter_policy_check() {
-        let key = Key::from_bytes_with_provider([0x44; Key::LEN], crate::Provider::COMPILED[0]);
+        let key = test_key();
         let ciphertext = encrypt(
             &key,
             b"random reader",
@@ -601,7 +602,7 @@ mod tests {
 
     #[test]
     fn construction_authenticates_complete_message_tail() {
-        let key = Key::from_bytes_with_provider([0x45; Key::LEN], crate::Provider::COMPILED[0]);
+        let key = test_key();
         let parameters = Parameters::SEGMENT_4_KIB;
         let plaintext = vec![0x5a; parameters.plaintext_segment_length() + 19];
         let ciphertext = encrypt(&key, b"random reader", parameters, &plaintext).unwrap();
@@ -634,7 +635,7 @@ mod tests {
 
     #[test]
     fn bounded_constructor_preserves_following_frame() {
-        let key = Key::from_bytes_with_provider([0x46; Key::LEN], crate::Provider::COMPILED[0]);
+        let key = test_key();
         let parameters = Parameters::SEGMENT_4_KIB;
         let plaintext = b"bounded random access";
         let ciphertext = encrypt(&key, b"random reader", parameters, plaintext).unwrap();

@@ -80,3 +80,43 @@ impl Provider {
         self.0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compiled_providers_match_features() {
+        let expected = &[
+            #[cfg(feature = "aws-lc-rs")]
+            Provider::AWS_LC_RS,
+            #[cfg(feature = "boring")]
+            Provider::BORING,
+            #[cfg(feature = "ring")]
+            Provider::RING,
+            #[cfg(feature = "rustcrypto")]
+            Provider::RUSTCRYPTO,
+        ];
+        assert_eq!(Provider::COMPILED, expected);
+        assert_eq!(
+            Provider::COMPILED
+                .iter()
+                .map(|provider| provider.name())
+                .collect::<Vec<_>>(),
+            [
+                #[cfg(feature = "aws-lc-rs")]
+                "aws-lc-rs",
+                #[cfg(feature = "boring")]
+                "boring",
+                #[cfg(feature = "ring")]
+                "ring",
+                #[cfg(feature = "rustcrypto")]
+                "rustcrypto",
+            ]
+        );
+        assert_eq!(
+            Provider::build_default(),
+            (Provider::COMPILED.len() == 1).then_some(Provider::COMPILED[0])
+        );
+    }
+}

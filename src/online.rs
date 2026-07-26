@@ -619,12 +619,14 @@ fn decrypt_body(mut decryptor: Decryptor, mut body: &[u8]) -> Result<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod boundary_tests {
+mod tests {
     use super::*;
+    use crate::key::test_key;
+    use crate::{HEADER_LENGTH, SEGMENT_OVERHEAD};
 
     #[test]
     fn online_states_reserve_last_position_for_final_segment() {
-        let key = Key::from_bytes_with_provider([0; Key::LEN], crate::Provider::COMPILED[0]);
+        let key = test_key();
         let parameters = Parameters::SEGMENT_4_KIB;
         let mut encryption = Encryptor::new(&key, b"segment limit", parameters).unwrap();
         let header = *encryption.header();
@@ -641,5 +643,219 @@ mod boundary_tests {
         assert_eq!(decryption.decrypt_segment(&final_segment).unwrap(), b"last");
         assert!(decryption.is_finished());
         decryption.finish().unwrap();
+    }
+
+    #[test]
+    fn complete_message_round_trips_boundaries() {
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let segment_length = parameters.plaintext_segment_length();
+        for length in [
+            0,
+            1,
+            segment_length - 1,
+            segment_length,
+            segment_length + 1,
+            2 * segment_length,
+            2 * segment_length + 3,
+        ] {
+            let plaintext: Vec<u8> = (0..length)
+                .map(|index| u8::try_from(index % 251).unwrap())
+                .collect();
+            let ciphertext = encrypt(&test_key(), b"aad", parameters, &plaintext).unwrap();
+            assert_eq!(
+                decrypt(&test_key(), b"aad", &ciphertext).unwrap(),
+                plaintext,
+                "round trip failed at length {length}"
+            );
+        }
+    }
+
+    #[test]
+    fn complete_message_decrypts_full_non_final_and_empty_final_segments() {
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let plaintext = vec![0x5a; parameters.plaintext_segment_length()];
+        let mut encryption = Encryptor::new(&test_key(), b"alternate framing", parameters).unwrap();
+        let header = *encryption.header();
+        let non_final = encryption.encrypt_non_final_segment(&plaintext).unwrap();
+        let final_segment = encryption.encrypt_final_segment(b"").unwrap();
+
+        let mut ciphertext =
+            Vec::with_capacity(Header::LEN + non_final.len() + final_segment.len());
+        ciphertext.extend_from_slice(header.as_ref());
+        ciphertext.extend_from_slice(&non_final);
+        ciphertext.extend_from_slice(&final_segment);
+
+        let layout = parameters
+            .ciphertext_layout(u64::try_from(ciphertext.len()).unwrap())
+            .unwrap();
+        assert_eq!(layout.segment_count(), 2);
+        assert_eq!(
+            decrypt(&test_key(), b"alternate framing", &ciphertext).unwrap(),
+            plaintext
+        );
+    }
+
+    #[test]
+    fn online_state_enforces_finalization() {
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let encryption = Encryptor::new(&test_key(), b"aad", parameters).unwrap();
+        assert_eq!(encryption.next_position(), 0);
+        let header = *encryption.header();
+        let final_segment = encryption.encrypt_final_segment(b"done").unwrap();
+
+        let decryption = Decryptor::new(&test_key(), b"aad", &header).unwrap();
+        assert_eq!(decryption.finish(), Err(Error::Truncated));
+
+        let mut decryption = Decryptor::new(&test_key(), b"aad", &header).unwrap();
+        assert_eq!(decryption.decrypt_segment(&final_segment).unwrap(), b"done");
+        assert!(decryption.is_finished());
+        assert_eq!(
+            decryption.decrypt_segment(&final_segment),
+            Err(Error::Closed)
+        );
+        assert!(decryption.finish().is_ok());
+
+        let mut decryption = Decryptor::new(&test_key(), b"aad", &header).unwrap();
+        assert_eq!(decryption.next_position(), 0);
+        let mut too_small = [0u8; 3];
+        assert!(matches!(
+            decryption.decrypt_segment_into(&final_segment, &mut too_small),
+            Err(Error::OutputTooSmall { .. })
+        ));
+        let mut output = [0u8; 4];
+        assert_eq!(
+            decryption
+                .decrypt_segment_into(&final_segment, &mut output)
+                .unwrap(),
+            output.len()
+        );
+        assert_eq!(&output, b"done");
+        assert!(decryption.finish().is_ok());
+
+        let mut invalid_prefix = [0u8; SEGMENT_OVERHEAD];
+        invalid_prefix[..SEGMENT_PREFIX_LENGTH]
+            .copy_from_slice(&u32::try_from(SEGMENT_OVERHEAD - 1).unwrap().to_be_bytes());
+        let mut decryption = Decryptor::new(&test_key(), b"aad", &header).unwrap();
+        assert!(matches!(
+            decryption.decrypt_segment(&invalid_prefix),
+            Err(Error::InvalidCiphertextLength {
+                actual,
+                required: LengthRequirement::Between {..},
+            }) if actual == SEGMENT_OVERHEAD - 1
+        ));
+
+        let encryption = Encryptor::new(&test_key(), b"aad", parameters).unwrap();
+        let header = *encryption.header();
+        let mut in_place = SegmentBuffer::new(parameters);
+        in_place
+            .prepare_plaintext(4)
+            .unwrap()
+            .copy_from_slice(b"done");
+        encryption
+            .encrypt_final_segment_in_place(&mut in_place)
+            .unwrap();
+        let mut decryption = Decryptor::new(&test_key(), b"aad", &header).unwrap();
+        assert_eq!(
+            decryption.decrypt_segment_in_place(&mut in_place).unwrap(),
+            b"done"
+        );
+        assert!(decryption.finish().is_ok());
+    }
+
+    #[test]
+    fn failed_final_encryption_returns_reusable_state() {
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let encryption = Encryptor::new(&test_key(), b"recover final", parameters).unwrap();
+        let header = *encryption.header();
+        let mut too_small = [0u8; SEGMENT_OVERHEAD];
+
+        let failure = encryption
+            .encrypt_final_segment_into(b"retry", &mut too_small)
+            .unwrap_err();
+        assert!(matches!(failure.error(), Error::OutputTooSmall { .. }));
+        assert!(!format!("{failure:?}").contains("Encryptor"));
+
+        let encryption = failure.into_encryptor();
+        assert_eq!(encryption.header(), &header);
+        assert_eq!(encryption.next_position(), 0);
+        let encrypted = encryption.encrypt_final_segment(b"retry").unwrap();
+
+        let mut decryption = Decryptor::new(&test_key(), b"recover final", &header).unwrap();
+        assert_eq!(decryption.decrypt_segment(&encrypted).unwrap(), b"retry");
+        decryption.finish().unwrap();
+    }
+
+    #[test]
+    fn authentication_and_framing_fail_closed() {
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let ciphertext = encrypt(&test_key(), b"correct aad", parameters, b"plaintext").unwrap();
+
+        assert_eq!(
+            decrypt(&test_key(), b"wrong aad", &ciphertext),
+            Err(Error::InvalidHeaderTag)
+        );
+        assert!(matches!(
+            Header::try_from(&ciphertext[..HEADER_LENGTH - 1]),
+            Err(Error::InvalidHeaderLength { .. })
+        ));
+        assert!(matches!(
+            Header::try_from(&ciphertext[..=HEADER_LENGTH]),
+            Err(Error::InvalidHeaderLength { .. })
+        ));
+
+        let mut bad_header = ciphertext.clone();
+        bad_header[HEADER_LENGTH - 1] ^= 1;
+        assert_eq!(
+            decrypt(&test_key(), b"correct aad", &bad_header),
+            Err(Error::InvalidHeaderTag)
+        );
+
+        let mut bad_segment = ciphertext.clone();
+        *bad_segment.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            decrypt(&test_key(), b"correct aad", &bad_segment),
+            Err(Error::AuthenticationFailed)
+        );
+
+        let header_only = &ciphertext[..HEADER_LENGTH];
+        assert_eq!(
+            decrypt(&test_key(), b"correct aad", header_only),
+            Err(Error::Truncated)
+        );
+
+        let truncated = &ciphertext[..ciphertext.len() - 1];
+        assert_eq!(
+            decrypt(&test_key(), b"correct aad", truncated),
+            Err(Error::InvalidCiphertextLength {
+                actual: truncated.len() - HEADER_LENGTH,
+                required: LengthRequirement::AtLeast(ciphertext.len() - HEADER_LENGTH)
+            })
+        );
+
+        let mut undersized_final = header_only.to_vec();
+        undersized_final.extend_from_slice(&4_u32.to_be_bytes());
+        assert!(matches!(
+            decrypt(&test_key(), b"correct aad", &undersized_final),
+            Err(Error::InvalidCiphertextLength { .. })
+        ));
+    }
+
+    #[test]
+    fn every_truncation_of_valid_ciphertext_rejected() {
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let plaintext = vec![0x3c; 3 * parameters.plaintext_segment_length() + 7];
+        let ciphertext = encrypt(&test_key(), b"aad", parameters, &plaintext).unwrap();
+
+        for end in 0..ciphertext.len() {
+            assert!(
+                decrypt(&test_key(), b"aad", &ciphertext[..end]).is_err(),
+                "accepted ciphertext truncated to {end} bytes"
+            );
+        }
+
+        assert_eq!(
+            decrypt_with_parameters(&test_key(), b"aad", Parameters::SEGMENT_1_MIB, &ciphertext,),
+            Err(Error::InvalidHeaderParameters)
+        );
     }
 }

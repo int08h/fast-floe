@@ -652,3 +652,21 @@ impl ProviderRng {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn providers_construct_only_fixed_rng() {
+        for &provider in Provider::COMPILED {
+            let rng = ProviderRng::new(provider);
+            let expected = if provider.name() == "rustcrypto" {
+                "chacha12"
+            } else {
+                provider.name()
+            };
+            assert_eq!(rng.name(), expected);
+        }
+    }
+}

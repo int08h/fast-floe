@@ -740,11 +740,8 @@ mod tests {
     use std::io::{Cursor, Read as _, Write as _};
 
     use super::*;
+    use crate::key::test_key as key;
     use crate::{decrypt, decrypt_with_parameters, encrypt, random_access};
-
-    fn key() -> Key {
-        Key::from_bytes_with_provider([0x5a; Key::LEN], crate::Provider::COMPILED[0])
-    }
 
     #[derive(Debug, Default)]
     struct FlushFails(Vec<u8>);
