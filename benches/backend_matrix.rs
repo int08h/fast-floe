@@ -12,10 +12,11 @@ const AAD: &[u8] = b"benchmark";
 const KIB: usize = 1024;
 const MIB: usize = 1024 * 1024;
 
-/// multipliers applied to last-level cache size so each
-/// case hits main memory instead staying in the cache
-const SMALL_SEGMENT_LLC_MULTIPLE: usize = 4;
-const LARGE_SEGMENT_LLC_MULTIPLE: usize = 16;
+/// Minimum working-set size relative to the detected last-level cache.
+const LLC_MULTIPLE: usize = 4;
+
+/// Minimum number of segments processed by each benchmark invocation.
+const MIN_SEGMENT_COUNT: usize = 96;
 
 /// Fallback message sizes if last-level cache cannot be detected.
 const DEFAULT_SMALL_SEGMENT_TARGET: usize = 4 * MIB;
@@ -46,6 +47,11 @@ fn benchmark_backend_matrix(criterion: &mut Criterion) {
                     u64::try_from(plaintext.len()).expect("target length fits in u64"),
                 )
                 .expect("benchmark layout must be valid");
+            assert!(
+                layout.segment_count()
+                    >= u64::try_from(MIN_SEGMENT_COUNT).expect("minimum segment count fits in u64"),
+                "benchmark case must process at least {MIN_SEGMENT_COUNT} segments"
+            );
             let ciphertext = encrypt(&key, AAD, parameters, &plaintext)
                 .expect("benchmark setup encryption failed");
 
@@ -318,24 +324,39 @@ fn refill_ciphertext(buffers: &mut [SegmentBuffer], ciphertext: &[u8], layout: M
 
 /// Pick per-case message lengths from the detected last-level cache size so
 /// the benchmark measures main-memory throughput rather than cache residency.
+fn target_length(parameters: Parameters, minimum_target: usize) -> usize {
+    let segment_target = parameters
+        .plaintext_segment_length()
+        .checked_mul(MIN_SEGMENT_COUNT)
+        .expect("benchmark segment target fits in usize");
+
+    minimum_target.max(segment_target)
+}
+
 fn target_lengths() -> (usize, usize) {
     if let Some(llc) = last_level_cache_size() {
-        let small = llc * SMALL_SEGMENT_LLC_MULTIPLE;
-        let large = llc * LARGE_SEGMENT_LLC_MULTIPLE;
+        let cache_target = llc
+            .checked_mul(LLC_MULTIPLE)
+            .expect("benchmark cache target fits in usize");
+        let small = target_length(Parameters::SEGMENT_4_KIB, cache_target);
+        let large = target_length(Parameters::SEGMENT_1_MIB, cache_target);
         eprintln!(
-            "detected {} last-level cache; message targets: {} (4KiB segments), {} (1MiB segments)",
+            "detected {} last-level cache; minimum working set: {}; message targets: {} (4KiB segments), {} (1MiB segments)",
             format_size(llc),
+            format_size(cache_target),
             format_size(small),
             format_size(large),
         );
         (small, large)
     } else {
+        let small = target_length(Parameters::SEGMENT_4_KIB, DEFAULT_SMALL_SEGMENT_TARGET);
+        let large = target_length(Parameters::SEGMENT_1_MIB, DEFAULT_LARGE_SEGMENT_TARGET);
         eprintln!(
-            "unable to detect last-level cache size; using default message targets: {} and {}",
-            format_size(DEFAULT_SMALL_SEGMENT_TARGET),
-            format_size(DEFAULT_LARGE_SEGMENT_TARGET),
+            "unable to detect last-level cache size; using fallback message targets: {} and {}",
+            format_size(small),
+            format_size(large),
         );
-        (DEFAULT_SMALL_SEGMENT_TARGET, DEFAULT_LARGE_SEGMENT_TARGET)
+        (small, large)
     }
 }
 
@@ -435,8 +456,8 @@ fn last_level_cache_size() -> Option<usize> {
 criterion_group! {
     name = benches;
     // 10 samples (the Criterion minimum) keeps sample_size * iteration_time
-    // within the 3s measurement window even for the slowest provider at the
-    // 16x-LLC message size, so Criterion does not warn about sample counts.
+    // within the 3s measurement window for the selected message sizes, so
+    // Criterion does not warn about sample counts.
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3))

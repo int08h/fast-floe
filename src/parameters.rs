@@ -1,6 +1,6 @@
 use core::iter::FusedIterator;
 use core::ops::Range;
-use std::ops::RangeInclusive;
+
 use crate::{Error, LengthRequirement, Result};
 
 pub(crate) const AEAD_IV_LENGTH: usize = 12;
@@ -13,10 +13,7 @@ pub(crate) const HEADER_TAG_LENGTH: usize = 32;
 pub(crate) const HEADER_LENGTH: usize =
     ENCODED_PARAMETERS_LENGTH + FLOE_IV_LENGTH + HEADER_TAG_LENGTH;
 
-const _: () = assert!(
-    HEADER_LENGTH == 74, 
-    "unexpected size of HEADER"
-);
+const _: () = assert!(HEADER_LENGTH == 74, "unexpected size of HEADER");
 
 const _: () = assert!(
     usize::BITS == 32 || usize::BITS == 64,
@@ -47,7 +44,7 @@ pub(crate) const fn length_u32_to_usize(value: u32) -> usize {
 }
 
 /// Converts an in-memory length to the crate's message-arithmetic type.
-/// `std` has no `From<usize> for u64`, so this documents the assumption once. 
+/// `std` has no `From<usize> for u64`, so this documents the assumption once.
 #[inline]
 pub(crate) const fn length_usize_to_u64(value: usize) -> u64 {
     value as u64
@@ -60,7 +57,7 @@ pub(crate) const SEGMENT_OVERHEAD_U64: u64 = length_usize_to_u64(SEGMENT_OVERHEA
 /// specification; AES-256-GCM, HKDF-Expand-SHA-384, and the 32-byte FLOE
 /// IV are fixed.
 ///
-/// Use [`Parameters::with_length`] to construct a [`Parameters`] instance with
+/// Use [`Parameters::with_segment_length`] to construct a [`Parameters`] instance with
 /// your desired segment length, or use one of the pre-made [`Parameters`] constants
 /// like [`Parameters::SEGMENT_4_KIB`] or [`Parameters::SEGMENT_1_MIB`] if convenient.
 ///
@@ -392,7 +389,7 @@ impl SegmentFraming {
 impl Parameters {
     /// Range valid of FLOE segment sizes in bytes. FLOE accepts _any_ segment size
     /// in this range and is not restricted to powers of 2.
-    pub const VALID_SEGMENT_LENGTHS: RangeInclusive<u32> = 64..=(u32::MAX - 2);
+    pub const VALID_SEGMENT_LENGTHS: Range<u32> = 64..(u32::MAX - 1);
 
     /// FLOE with 64-byte encrypted segments.
     pub const SEGMENT_64_B: Self = Self {
@@ -431,7 +428,12 @@ impl Parameters {
 
     /// Construct a [`Parameters`] instance with the provided segment length in bytes.
     /// `segment_len` can be any value in the range [`Parameters::VALID_SEGMENT_LENGTHS`].
-    pub fn with_length(segment_len: u32) -> Result<Self> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidParameters`] when `segment_len` is outside the
+    /// supported range.
+    pub fn with_segment_length(segment_len: u32) -> Result<Self> {
         if !Self::VALID_SEGMENT_LENGTHS.contains(&segment_len) {
             return Err(Error::InvalidParameters);
         }
@@ -465,10 +467,6 @@ impl Parameters {
     }
 
     /// Calculates the complete FLOE layout for `plaintext_length`.
-    ///
-    /// This is the canonical encryption layout: empty plaintext produces one
-    /// empty final segment, and an exact multiple of the plaintext segment
-    /// length ends with a full-sized final segment.
     ///
     /// # Errors
     ///
@@ -520,10 +518,8 @@ impl Parameters {
     pub fn ciphertext_layout(self, ciphertext_length: u64) -> Result<MessageLayout> {
         let body_length = ciphertext_length
             .checked_sub(HEADER_LENGTH_U64)
-            .ok_or_else(|| {
-                Error::InvalidHeaderLength {
-                    actual: usize::try_from(ciphertext_length).unwrap_or(usize::MAX),
-                }
+            .ok_or_else(|| Error::InvalidHeaderLength {
+                actual: usize::try_from(ciphertext_length).unwrap_or(usize::MAX),
             })?;
 
         if body_length == 0 {
@@ -588,13 +584,11 @@ impl Parameters {
     }
 
     pub(crate) fn decode(encoded: [u8; ENCODED_PARAMETERS_LENGTH]) -> Result<Self> {
-        let mut segment_length = [0u8; 4];
-        segment_length.copy_from_slice(&encoded[2..6]);
-        let parameters = match u32::from_be_bytes(segment_length) {
-            4096 => Self::SEGMENT_4_KIB,
-            1_048_576 => Self::SEGMENT_1_MIB,
-            _ => return Err(Error::InvalidHeaderParameters),
-        };
+        let mut seg_len_bytes = [0u8; 4];
+        seg_len_bytes.copy_from_slice(&encoded[2..6]);
+
+        let segment_length = u32::from_be_bytes(seg_len_bytes);
+        let parameters = Self::with_segment_length(segment_length)?;
 
         if parameters.encode() == encoded {
             Ok(parameters)

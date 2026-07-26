@@ -250,6 +250,44 @@ fn parameter_encoding_matches_specification() {
 }
 
 #[test]
+fn parameters_accept_exactly_valid_segment_lengths() {
+    let valid_range = Parameters::VALID_SEGMENT_LENGTHS;
+    let first_valid = valid_range.start;
+    let last_valid = valid_range.end - 1;
+
+    for segment_length in [
+        first_valid,
+        first_valid + 1,
+        4 * 1024,
+        64 * 1024,
+        1_000_000,
+        1024 * 1024,
+        last_valid,
+    ] {
+        assert!(valid_range.contains(&segment_length));
+
+        let parameters = Parameters::with_segment_length(segment_length).unwrap();
+        assert_eq!(
+            parameters.ciphertext_segment_length(),
+            usize::try_from(segment_length).unwrap()
+        );
+        assert_eq!(Parameters::decode(parameters.encode()), Ok(parameters));
+    }
+
+    for segment_length in [0, first_valid - 1, valid_range.end, u32::MAX] {
+        assert!(!valid_range.contains(&segment_length));
+        assert_eq!(
+            Parameters::with_segment_length(segment_length),
+            Err(Error::InvalidParameters)
+        );
+
+        let mut encoded = Parameters::SEGMENT_4_KIB.encode();
+        encoded[2..6].copy_from_slice(&segment_length.to_be_bytes());
+        assert!(Parameters::decode(encoded).is_err());
+    }
+}
+
+#[test]
 fn typed_headers_support_strict_and_inferred_decryption() {
     let plaintext = b"header-selected parameters";
     let ciphertext = encrypt(

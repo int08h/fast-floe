@@ -7,16 +7,16 @@ large files and byte streams with bounded-memory and random access.
 ## Introduction
 
 `fast-floe` implements the [Fast Lightweight Online Encryption (FLOE)
-specification](https://c2sp.org/FLOE) in Rust. FLOE divides a message into
-independently authenticated and encrypted segments. A recipient can encrypt/decrypt a 
+specification](https://c2sp.org/FLOE) in Rust. FLOE divides a message into independently authenticated
+and encrypted segments of user chosen length. A recipient can encrypt/decrypt a
 large message one segment at a time and read/seek randomly into the ciphertext. 
 
 FLOE is built for really big data, streaming data where you might not know size ahead 
 of time, data that might arrive out-of-order, and random-access into encrypted data.
 
-Callers can select a 4 KiB or 1 MiB segment size at encryption time to trade off throughput
-for random-access overhead (smaller segment size == cheaper random access, and larger segment
-size == more throughput).
+Callers select the segment length at encryption time to trade off throughput
+for random-access overhead (smaller segment length == cheaper random access, and larger segment
+length == more throughput).
 
 Multiple cryptography providers are supported (aws-lc-rs, boring, ring, and `RustCrypto`).
 They all interoperate with each other (i.e. provider choice does not affect wire format).
@@ -41,11 +41,12 @@ use fast_floe::{Key, Parameters, decrypt, encrypt};
 let key = Key::generate()?;
 let aad = b"tenant=acme;object=backup";
 let plaintext = b"data to protect";
+let params = Parameters::with_segment_length(1_000_000)?;
 
 let ciphertext = encrypt(
     &key,
     aad,
-    Parameters::SEGMENT_4_KIB,
+    params,
     plaintext,
 )?;
 
@@ -66,8 +67,8 @@ The three inputs are:
 - `AAD`: context that must be authenticated with the ciphertext, such as an
   session ID or protocol version. FLOE does not store the AAD. Decryption requires the
   same AAD bytes to succeed.
-- `Parameters`: the encrypted segment size. Choose 4 KiB for finer random reads
-  or 1 MiB for higher throughput.
+- `Parameters`: the encrypted segment length. FLOE supports all segments lengths from
+  64 to 4,294,967,294 (`u32::MAX` - 2) bytes.
 
 ## Choose an API
 
@@ -104,13 +105,14 @@ use fast_floe::{Key, Parameters};
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let key = Key::from_bytes([0x42; Key::LEN]);
 let aad = b"file metadata";
+let params = Parameters::with_segment_length(4096)?;
 
 let input = Cursor::new(b"a potentially large input".as_slice());
 let mut encrypting = EncryptReader::new(
     input,
     &key,
     aad,
-    Parameters::SEGMENT_4_KIB,
+    params
 )?;
 let mut ciphertext = Vec::new();
 io::copy(&mut encrypting, &mut ciphertext)?;
@@ -183,7 +185,7 @@ use fast_floe::{Key, Parameters};
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let key = Key::generate()?;
 let aad = b"example stream";
-let parameters = Parameters::SEGMENT_4_KIB;
+let parameters = Parameters::with_segment_length(64 * 1024)?;
 let segment_size = parameters.plaintext_segment_length();
 let plaintext = vec![b'A'; segment_size * 2 + segment_size / 2];
 let mut input = Cursor::new(&plaintext);
@@ -240,7 +242,7 @@ use fast_floe::{Key, Parameters};
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let key = Key::from_bytes([0x42; Key::LEN]);
 let aad = b"context stuff";
-let parameters = Parameters::SEGMENT_4_KIB;
+let parameters = Parameters::SEGMENT_8_MIB;
 let plaintext = b"low-level api data example";
 let layout = parameters.plaintext_layout(plaintext.len() as u64)?;
 
@@ -284,12 +286,14 @@ allocation, `*_raw` methods are available for use w/ your own buffer management.
 
 ## Segment sizes
 
-The crate supports two segment size choices:
+FLOE supports all segment lengths between 64 and 4,294,967,294 (`u32::MAX` - 2) bytes, inclusive.
+Any size in that range is valid, including odd lengths and non-powers-of-2. The constant
+`Parameters::VALID_SEGMENT_LENGTHS` encodes this range.
 
-- `Parameters::SEGMENT_4_KIB`
-- `Parameters::SEGMENT_1_MIB`
+Use `Parameters::with_segment_length()` to construct `Parameters` with your desired length,
+or use one of the `Parameters::SEGMENT_*` convenience constants.
 
-Only the encrypted segment size differs, all other parameters (AES-256-GCM, HKDF-SHA-384,
+Only the encrypted segment size differs, all other FLOE parameters (AES-256-GCM, HKDF-SHA-384,
 IV length) are the same.
 
 `Parameters::plaintext_layout` and `Parameters::ciphertext_layout` calculate a
@@ -355,7 +359,9 @@ Run all provider and segment-size benchmarks with:
 
 ### Benchmark results
 
-Median throughput in GiB/s with each provider compiled solo with `-C target-cpu=native`.
+Median throughput in GiB/s with each provider compiled solo with `-C target-cpu=native`. Each
+benchmark trial sizes its buffer to be at least 4x the detected last-level-cache size to ensure
+we're reaching actual memory, not spinning in cache.
 
 The "into" columns write to a separate output buffer (using scatter/gather if supported by the provider)
 while "in place" overwrite their input buffer.
@@ -381,14 +387,14 @@ In GiB/sec, higher is better
 
 | Provider     | Segments | Encrypt into | Encrypt in place | Decrypt into | Decrypt in place |
 |--------------|----------|-------------:|-----------------:|-------------:|-----------------:|
-| `aws-lc-rs`  | 1 MiB    |         7.09 |             8.65 |         8.70 |             8.76 |
-| `boring`     | 1 MiB    |         6.17 |             7.11 |         6.17 |             7.17 |
-| `ring`       | 1 MiB    |         6.20 |             7.19 |         6.18 |             7.08 |
-| `rustcrypto` | 1 MiB    |         3.42 |             3.75 |         3.68 |             3.76 |
-| `aws-lc-rs`  | 4 KiB    |         6.18 |             7.08 |         7.34 |             7.58 |
-| `boring`     | 4 KiB    |         5.67 |             6.46 |         5.76 |             6.56 |
-| `ring`       | 4 KiB    |         5.46 |             6.22 |         5.73 |             6.55 |
-| `rustcrypto` | 4 KiB    |         3.20 |             3.68 |         3.40 |             3.63 |
+| `aws-lc-rs`  | 1 MiB    |         6.99 |             8.62 |         8.73 |             8.75 |
+| `boring`     | 1 MiB    |         6.05 |             7.17 |         6.07 |             7.14 |
+| `ring`       | 1 MiB    |         6.05 |             7.17 |         6.03 |             7.17 |
+| `rustcrypto` | 1 MiB    |         3.33 |             3.71 |         3.63 |             3.71 |
+| `aws-lc-rs`  | 4 KiB    |         6.07 |             7.13 |         7.30 |             7.60 |
+| `boring`     | 4 KiB    |         5.73 |             6.47 |         5.80 |             6.51 |
+| `ring`       | 4 KiB    |         5.42 |             6.23 |         5.74 |             6.53 |
+| `rustcrypto` | 4 KiB    |         3.19 |             3.44 |         3.39 |             3.45 |
 
 ## License
 
