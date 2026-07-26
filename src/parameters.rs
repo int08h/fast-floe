@@ -31,6 +31,7 @@ pub const SEGMENT_PAYLOAD_OFFSET: usize = SEGMENT_PREFIX_LENGTH + AEAD_IV_LENGTH
 pub(crate) const SEGMENT_OVERHEAD: usize = SEGMENT_PAYLOAD_OFFSET + AEAD_TAG_LENGTH;
 
 const ROTATION_BITS: u8 = 20;
+const ROTATION_MASK: u64 = !((1_u64 << ROTATION_BITS) - 1);
 const FLOE_IV_LENGTH_U32: u32 = 32;
 const _: () = assert!(length_u32_to_usize(FLOE_IV_LENGTH_U32) == FLOE_IV_LENGTH);
 
@@ -57,13 +58,15 @@ pub(crate) const SEGMENT_OVERHEAD_U64: u64 = length_usize_to_u64(SEGMENT_OVERHEA
 /// specification; AES-256-GCM, HKDF-Expand-SHA-384, and the 32-byte FLOE
 /// IV are fixed.
 ///
-/// Use [`Parameters::with_segment_length`] to construct a [`Parameters`] instance with
+/// Use [`Parameters::from_segment_length`] to construct a [`Parameters`] instance with
 /// your desired segment length, or use one of the pre-made [`Parameters`] constants
 /// like [`Parameters::SEGMENT_4_KIB`] or [`Parameters::SEGMENT_1_MIB`] if convenient.
 ///
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Parameters {
     ciphertext_segment_length: u32,
+    #[cfg(test)]
+    rotation_mask: u64,
 }
 
 /// Whether a segment is an internal or final segment.
@@ -389,42 +392,33 @@ impl SegmentFraming {
 impl Parameters {
     /// Range valid of FLOE segment sizes in bytes. FLOE accepts _any_ segment size
     /// in this range and is not restricted to powers of 2.
+    #[cfg(not(test))]
     pub const VALID_SEGMENT_LENGTHS: Range<u32> = 64..(u32::MAX - 1);
 
+    /// Test-only segment-size range that includes the spec's 40-byte KATs.
+    #[cfg(test)]
+    pub const VALID_SEGMENT_LENGTHS: Range<u32> = 40..(u32::MAX - 1);
+
     /// FLOE with 64-byte encrypted segments.
-    pub const SEGMENT_64_B: Self = Self {
-        ciphertext_segment_length: 64,
-    };
+    pub const SEGMENT_64_B: Self = Self::from_segment_length_unchecked(64);
 
     /// FLOE with 4 KiB encrypted segments.
-    pub const SEGMENT_4_KIB: Self = Self {
-        ciphertext_segment_length: 4 * 1024,
-    };
+    pub const SEGMENT_4_KIB: Self = Self::from_segment_length_unchecked(4 * 1024);
 
     /// FLOE with 1 MiB encrypted segments.
-    pub const SEGMENT_1_MIB: Self = Self {
-        ciphertext_segment_length: 1024 * 1024,
-    };
+    pub const SEGMENT_1_MIB: Self = Self::from_segment_length_unchecked(1024 * 1024);
 
     /// FLOE with 4 MiB encrypted segments.
-    pub const SEGMENT_4_MIB: Self = Self {
-        ciphertext_segment_length: 4 * 1024 * 1024,
-    };
+    pub const SEGMENT_4_MIB: Self = Self::from_segment_length_unchecked(4 * 1024 * 1024);
 
     /// FLOE with 5 MiB encrypted segments.
-    pub const SEGMENT_5_MIB: Self = Self {
-        ciphertext_segment_length: 5 * 1024 * 1024,
-    };
+    pub const SEGMENT_5_MIB: Self = Self::from_segment_length_unchecked(5 * 1024 * 1024);
 
     /// FLOE with 8 MiB encrypted segments.
-    pub const SEGMENT_8_MIB: Self = Self {
-        ciphertext_segment_length: 8 * 1024 * 1024,
-    };
+    pub const SEGMENT_8_MIB: Self = Self::from_segment_length_unchecked(8 * 1024 * 1024);
 
     /// FLOE with 16 MiB encrypted segments.
-    pub const SEGMENT_16_MIB: Self = Self {
-        ciphertext_segment_length: 16 * 1024 * 1024,
-    };
+    pub const SEGMENT_16_MIB: Self = Self::from_segment_length_unchecked(16 * 1024 * 1024);
 
     /// Construct a [`Parameters`] instance with the provided segment length in bytes.
     /// `segment_len` can be any value in the range [`Parameters::VALID_SEGMENT_LENGTHS`].
@@ -433,14 +427,30 @@ impl Parameters {
     ///
     /// Returns [`Error::InvalidParameters`] when `segment_len` is outside the
     /// supported range.
-    pub fn with_segment_length(segment_len: u32) -> Result<Self> {
+    pub fn from_segment_length(segment_len: u32) -> Result<Self> {
         if !Self::VALID_SEGMENT_LENGTHS.contains(&segment_len) {
             return Err(Error::InvalidParameters);
         }
 
-        Ok(Self {
+        Ok(Self::from_segment_length_unchecked(segment_len))
+    }
+
+    const fn from_segment_length_unchecked(segment_len: u32) -> Self {
+        Self {
             ciphertext_segment_length: segment_len,
-        })
+            #[cfg(test)]
+            rotation_mask: ROTATION_MASK,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_rotation_mask_for_test(
+        segment_len: u32,
+        rotation_mask: u64,
+    ) -> Result<Self> {
+        let mut parameters = Self::from_segment_length(segment_len)?;
+        parameters.rotation_mask = rotation_mask;
+        Ok(parameters)
     }
 
     /// Returns the exact length of every non-final ciphertext segment.
@@ -588,7 +598,7 @@ impl Parameters {
         seg_len_bytes.copy_from_slice(&encoded[2..6]);
 
         let segment_length = u32::from_be_bytes(seg_len_bytes);
-        let parameters = Self::with_segment_length(segment_length)?;
+        let parameters = Self::from_segment_length(segment_length)?;
 
         if parameters.encode() == encoded {
             Ok(parameters)
@@ -598,8 +608,14 @@ impl Parameters {
     }
 
     #[inline]
-    pub(crate) const fn masked_position(position: u64) -> u64 {
-        let low_bits = (1_u64 << ROTATION_BITS) - 1;
-        position & !low_bits
+    #[cfg(not(test))]
+    pub(crate) const fn masked_position(self, position: u64) -> u64 {
+        let _ = self;
+        position & ROTATION_MASK
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn masked_position(self, position: u64) -> u64 {
+        position & self.rotation_mask
     }
 }
