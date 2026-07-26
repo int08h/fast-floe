@@ -232,10 +232,6 @@ fn ambiguous_keys_fail_from_every_entry_layer() {
 #[test]
 fn parameter_encoding_matches_specification() {
     assert_eq!(
-        Parameters::ALL,
-        [Parameters::SEGMENT_4_KIB, Parameters::SEGMENT_1_MIB]
-    );
-    assert_eq!(
         Parameters::SEGMENT_4_KIB.encode(),
         hex::decode("00000000100000000020").unwrap().as_slice()
     );
@@ -251,6 +247,44 @@ fn parameter_encoding_matches_specification() {
         Parameters::SEGMENT_1_MIB.ciphertext_segment_length(),
         1024 * 1024
     );
+}
+
+#[test]
+fn parameters_accept_exactly_valid_segment_lengths() {
+    let valid_range = Parameters::VALID_SEGMENT_LENGTHS;
+    let first_valid = valid_range.start;
+    let last_valid = valid_range.end - 1;
+
+    for segment_length in [
+        first_valid,
+        first_valid + 1,
+        4 * 1024,
+        64 * 1024,
+        1_000_000,
+        1024 * 1024,
+        last_valid,
+    ] {
+        assert!(valid_range.contains(&segment_length));
+
+        let parameters = Parameters::from_segment_length(segment_length).unwrap();
+        assert_eq!(
+            parameters.ciphertext_segment_length(),
+            usize::try_from(segment_length).unwrap()
+        );
+        assert_eq!(Parameters::decode(parameters.encode()), Ok(parameters));
+    }
+
+    for segment_length in [0, first_valid - 1, valid_range.end, u32::MAX] {
+        assert!(!valid_range.contains(&segment_length));
+        assert_eq!(
+            Parameters::from_segment_length(segment_length),
+            Err(Error::InvalidParameters)
+        );
+
+        let mut encoded = Parameters::SEGMENT_4_KIB.encode();
+        encoded[2..6].copy_from_slice(&segment_length.to_be_bytes());
+        assert!(Parameters::decode(encoded).is_err());
+    }
 }
 
 #[test]
@@ -712,13 +746,13 @@ fn rotation_and_position_boundaries_match_specification() {
     const ROTATION_INTERVAL: u64 = 1 << 20;
 
     let parameters = Parameters::SEGMENT_4_KIB;
-    assert_eq!(Parameters::masked_position(ROTATION_INTERVAL - 1), 0);
+    assert_eq!(parameters.masked_position(ROTATION_INTERVAL - 1), 0);
     assert_eq!(
-        Parameters::masked_position(ROTATION_INTERVAL),
+        parameters.masked_position(ROTATION_INTERVAL),
         ROTATION_INTERVAL
     );
     assert_eq!(
-        Parameters::masked_position(crate::AEAD_MAX_SEGMENTS - 1),
+        parameters.masked_position(crate::AEAD_MAX_SEGMENTS - 1),
         crate::AEAD_MAX_SEGMENTS - ROTATION_INTERVAL
     );
 
@@ -1078,7 +1112,7 @@ fn generated_keys_have_required_size() {
 }
 
 #[test]
-fn every_supported_repo_local_kat_decrypts() {
+fn every_kat_decrypts() {
     let manifest_directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let kat_directory = manifest_directory.join("kats");
     if !kat_directory.exists() {
@@ -1096,7 +1130,10 @@ fn every_supported_repo_local_kat_decrypts() {
             file_name
                 .strip_suffix("_ct.txt")
                 .filter(|name| {
-                    name.ends_with("GCM256_IV256_1M") || name.ends_with("GCM256_IV256_4K")
+                    name.ends_with("GCM256_IV256_1M")
+                        || name.ends_with("GCM256_IV256_4K")
+                        || name.ends_with("GCM256_IV256_64")
+                        || name.ends_with("rotation")
                 })
                 .map(str::to_owned)
         })
@@ -1109,7 +1146,7 @@ fn every_supported_repo_local_kat_decrypts() {
     );
     assert_eq!(
         kat_names.len(),
-        10,
+        20,
         "expected every supported KAT in {}",
         kat_directory.display()
     );
@@ -1119,6 +1156,10 @@ fn every_supported_repo_local_kat_decrypts() {
             Parameters::SEGMENT_1_MIB
         } else if name.ends_with("GCM256_IV256_4K") {
             Parameters::SEGMENT_4_KIB
+        } else if name.ends_with("GCM256_IV256_64") {
+            Parameters::SEGMENT_64_B
+        } else if name.ends_with("rotation") {
+            Parameters::with_rotation_mask_for_test(40, !3).unwrap()
         } else {
             panic!("unrecognized KAT {name}");
         };
@@ -1127,6 +1168,7 @@ fn every_supported_repo_local_kat_decrypts() {
         let expected_plaintext = read_hex(&kat_directory.join(format!("{name}_pt.txt")));
         let actual_plaintext = decrypt_with_parameters(&KEY, KAT_AAD, parameters, &ciphertext)
             .unwrap_or_else(|error| panic!("KAT {name} failed: {error}"));
+
         assert_eq!(actual_plaintext, expected_plaintext, "KAT {name} mismatch");
     }
 }

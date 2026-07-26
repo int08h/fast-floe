@@ -195,7 +195,7 @@ impl KeyCache {
             return Err(Error::SegmentLimit);
         }
 
-        let masked_position = Parameters::masked_position(position);
+        let masked_position = context.parameters.masked_position(position);
         if self
             .cached_key
             .as_ref()

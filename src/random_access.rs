@@ -252,7 +252,7 @@ impl<R: Read + Seek> Reader<R> {
                     .end
                     .min(segment_start + length_usize_to_u64(plaintext.len()))
                     - segment_start;
-                
+
                 let local_end = usize::try_from(local_end_u64).map_err(|_| length_overflow())?;
                 let chunk = &plaintext[local_start..local_end];
                 output[written..written + chunk.len()].copy_from_slice(chunk);
