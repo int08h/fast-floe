@@ -128,3 +128,68 @@ impl TryFrom<&[u8]> for Key {
         Ok(Self::from_bytes(bytes))
     }
 }
+
+// The all-zero key every KAT is generated with, bound to the build's first
+// compiled provider so multi-provider test builds stay deterministic.
+#[cfg(test)]
+pub(crate) fn test_key() -> Key {
+    Key::from_bytes_with_provider([0; Key::LEN], Provider::COMPILED[0])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Parameters, decrypt, encrypt};
+
+    #[test]
+    fn implicit_keys_resolve_only_for_single_provider_builds() {
+        // Given a key imported without naming a provider
+        let key = Key::from_bytes([0x21; Key::LEN]);
+
+        if let Some(provider) = Provider::build_default() {
+            // When exactly one provider is compiled into this build
+
+            // Then imported and generated keys resolve to it implicitly
+            assert_eq!(key.provider(), Ok(provider));
+            assert_eq!(Key::generate().unwrap().provider(), Ok(provider));
+
+            // Then the implicitly resolved key round-trips a message
+            let ciphertext = encrypt(
+                &key,
+                b"implicit provider",
+                Parameters::SEGMENT_4_KIB,
+                b"message",
+            )
+            .unwrap();
+            assert_eq!(
+                decrypt(&key, b"implicit provider", &ciphertext).unwrap(),
+                b"message"
+            );
+        } else {
+            // When multiple providers are compiled into this build
+
+            // Then resolution and generation demand an explicit provider
+            assert_eq!(key.provider(), Err(Error::ProviderSelectionRequired));
+            assert!(matches!(
+                Key::generate(),
+                Err(Error::ProviderSelectionRequired)
+            ));
+        }
+    }
+
+    #[test]
+    fn generated_keys_have_required_size() {
+        // Given every provider compiled into this build
+        for &provider in Provider::COMPILED {
+            // When the provider generates a key
+            // Then the key is exactly Key::LEN bytes
+            assert_eq!(
+                Key::generate_with_provider(provider)
+                    .unwrap()
+                    .as_bytes()
+                    .len(),
+                Key::LEN
+            );
+        }
+    }
+}

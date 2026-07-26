@@ -1187,3 +1187,559 @@ fn derive_segment_key(
     key_material.zeroize();
     key
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use rayon::prelude::*;
+
+    use super::*;
+    use crate::key::test_key;
+    use crate::{decrypt, encrypt};
+
+    #[test]
+    fn inferred_decryption_uses_header_declared_parameters() {
+        // Given a ciphertext whose header declares 1 MiB segments
+        let plaintext = b"header-selected parameters";
+        let ciphertext = encrypt(
+            &test_key(),
+            b"header inference",
+            Parameters::SEGMENT_1_MIB,
+            plaintext,
+        )
+        .unwrap();
+
+        // When the header is parsed from the ciphertext prefix
+        let header = Header::try_from(&ciphertext[..Header::LEN]).unwrap();
+
+        // Then the typed header has the specified length and exposes the
+        // declared parameters before authentication
+        assert_eq!(Header::LEN, HEADER_LENGTH);
+        assert_eq!(
+            header.unverified_parameters().unwrap(),
+            Parameters::SEGMENT_1_MIB
+        );
+
+        // Then inferred decryption adopts those parameters and the message
+        // decrypts
+        assert_eq!(
+            start_decryption_inferred(&test_key(), b"header inference", &header)
+                .unwrap()
+                .parameters(),
+            Parameters::SEGMENT_1_MIB
+        );
+        assert_eq!(
+            decrypt(&test_key(), b"header inference", &ciphertext).unwrap(),
+            plaintext
+        );
+    }
+
+    #[test]
+    fn tampered_header_parameters_fail_header_authentication() {
+        // Given a valid ciphertext whose encoded parameters are overwritten
+        // with a different, individually valid parameter set
+        let ciphertext = encrypt(
+            &test_key(),
+            b"header inference",
+            Parameters::SEGMENT_1_MIB,
+            b"header-selected parameters",
+        )
+        .unwrap();
+        let mut changed_parameters = ciphertext.clone();
+        changed_parameters[..ENCODED_PARAMETERS_LENGTH]
+            .copy_from_slice(&Parameters::SEGMENT_4_KIB.encode());
+
+        // When the tampered header is parsed
+        let changed_header = Header::try_from(&changed_parameters[..Header::LEN]).unwrap();
+
+        // Then the unauthenticated view reports the tampered parameters,
+        // but decryption rejects the header tag
+        assert_eq!(
+            changed_header.unverified_parameters().unwrap(),
+            Parameters::SEGMENT_4_KIB
+        );
+        assert_eq!(
+            decrypt(&test_key(), b"header inference", &changed_parameters),
+            Err(Error::InvalidHeaderTag)
+        );
+    }
+
+    #[test]
+    fn unsupported_header_parameters_rejected_before_authentication() {
+        // Given a header whose parameter encoding declares an unsupported
+        // profile
+        let (_, header) =
+            start_encryption(&test_key(), b"header inference", Parameters::SEGMENT_1_MIB).unwrap();
+        let mut unsupported = <[u8; Header::LEN]>::from(header);
+        unsupported[0] = 1;
+        let unsupported = Header::from(unsupported);
+
+        // When the parameters are decoded or inferred decryption starts
+        // Then both reject the encoded parameters
+        assert_eq!(
+            unsupported.unverified_parameters(),
+            Err(Error::InvalidHeaderParameters)
+        );
+        assert!(matches!(
+            start_decryption_inferred(&test_key(), b"header inference", &unsupported),
+            Err(Error::InvalidHeaderParameters)
+        ));
+    }
+
+    #[test]
+    fn final_segment_prefix_must_equal_actual_segment_length() {
+        // This drives `decrypt_segment_at` directly because
+        // `SegmentFraming::decode` would reject the prefix before
+        // `validate_segment` is exercised on the online path.
+
+        // Given a valid final segment whose length prefix is forged to
+        // declare an extra high bit
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let (mut encryption, header) =
+            start_encryption(&test_key(), b"forged final prefix", parameters).unwrap();
+        let layout = parameters.plaintext_layout(4).unwrap();
+        let mut segment = encryption
+            .encrypt_segment(b"last", layout.final_segment())
+            .unwrap();
+        let true_length = u32::try_from(segment.len()).unwrap();
+        let forged = true_length | 0x0001_0000;
+        segment[..SEGMENT_PREFIX_LENGTH].copy_from_slice(&forged.to_be_bytes());
+
+        // When the segment is decrypted at its position
+        let mut decryption =
+            start_decryption(&test_key(), b"forged final prefix", parameters, &header).unwrap();
+        let error = decryption
+            .decrypt_segment_at(&segment, 0, SegmentKind::Final)
+            .unwrap_err();
+
+        // Then the mismatch between declared and actual length is rejected
+        assert!(matches!(
+            error,
+            Error::InvalidCiphertextLength {
+                actual,
+                required: LengthRequirement::Exactly(required),
+            } if actual == segment.len() && required == segment.len() + 0x1_0000
+        ));
+    }
+
+    #[test]
+    fn random_access_segments_decrypt_out_of_order() {
+        // Given a two-segment message encrypted segment by segment
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let full = vec![0x5a; parameters.plaintext_segment_length()];
+        let final_plaintext = b"final";
+        let layout = parameters
+            .plaintext_layout(u64::try_from(full.len() + final_plaintext.len()).unwrap())
+            .unwrap();
+        let segment_zero_layout = layout.segment_for_position(0).unwrap();
+        let segment_one_layout = layout.segment_for_position(1).unwrap();
+        let (mut encryption, header) =
+            start_encryption(&test_key(), b"random access", parameters).unwrap();
+        let segment_zero = encryption
+            .encrypt_segment(&full, segment_zero_layout)
+            .unwrap();
+        let segment_one = encryption
+            .encrypt_segment(final_plaintext, segment_one_layout)
+            .unwrap();
+
+        // When the segments are decrypted in reverse order
+        let mut decryption =
+            start_decryption(&test_key(), b"random access", parameters, &header).unwrap();
+
+        // Then each decrypts independently of processing order
+        assert_eq!(
+            decryption
+                .decrypt_segment(&segment_one, segment_one_layout)
+                .unwrap(),
+            final_plaintext
+        );
+        assert_eq!(
+            decryption
+                .decrypt_segment(&segment_zero, segment_zero_layout)
+                .unwrap(),
+            full
+        );
+    }
+
+    #[test]
+    fn states_and_shared_contexts_cross_thread_boundaries() {
+        // Given the parallel-processing state and context types
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+
+        // Then states move between threads and shared contexts are also
+        // safe to reference concurrently
+        assert_send::<EncryptionState>();
+        assert_send::<DecryptionState>();
+        assert_send::<SharedEncryptionContext>();
+        assert_sync::<SharedEncryptionContext>();
+        assert_send::<SharedDecryptionContext>();
+        assert_sync::<SharedDecryptionContext>();
+    }
+
+    #[test]
+    fn parallel_contexts_create_independent_states() {
+        // Given an eight-segment message split across a thread pool
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let segment_length = parameters.plaintext_segment_length();
+        let plaintext_segments: Vec<Vec<u8>> = (0..8)
+            .map(|position| {
+                let length = if position == 7 { 17 } else { segment_length };
+                vec![u8::try_from(position).unwrap(); length]
+            })
+            .collect();
+        let layout = parameters
+            .plaintext_layout(
+                plaintext_segments
+                    .iter()
+                    .map(|segment| u64::try_from(segment.len()).unwrap())
+                    .sum(),
+            )
+            .unwrap();
+
+        // When every segment is encrypted on its own forked state
+        let (encryption, header) =
+            start_encryption(&test_key(), b"parallel states", parameters).unwrap();
+        let encryption = encryption.into_shared();
+        assert_eq!(encryption.parameters(), parameters);
+        let encrypted_segments: Vec<Vec<u8>> = plaintext_segments
+            .par_iter()
+            .enumerate()
+            .map_init(
+                || encryption.fork(),
+                |state, (position, plaintext)| {
+                    assert_eq!(state.parameters(), parameters);
+                    let segment = layout
+                        .segment_for_position(u64::try_from(position).unwrap())
+                        .unwrap();
+                    state.encrypt_segment(plaintext, segment)
+                },
+            )
+            .collect::<crate::Result<_>>()
+            .unwrap();
+
+        // When every encrypted segment is decrypted on its own forked state
+        let decryption =
+            start_decryption(&test_key(), b"parallel states", parameters, &header).unwrap();
+        let decryption = decryption.into_shared();
+        assert_eq!(decryption.parameters(), parameters);
+        let decrypted_segments: Vec<Vec<u8>> = encrypted_segments
+            .par_iter()
+            .enumerate()
+            .map_init(
+                || decryption.fork(),
+                |state, (position, encrypted)| {
+                    assert_eq!(state.parameters(), parameters);
+                    let segment = layout
+                        .segment_for_position(u64::try_from(position).unwrap())
+                        .unwrap();
+                    state.decrypt_segment(encrypted, segment)
+                },
+            )
+            .collect::<crate::Result<_>>()
+            .unwrap();
+
+        // Then the reassembled plaintext matches the original
+        assert_eq!(decrypted_segments, plaintext_segments);
+    }
+
+    #[test]
+    fn rotation_and_position_boundaries_match_specification() {
+        const ROTATION_INTERVAL: u64 = 1 << 20;
+
+        // Given segments encrypted on both sides of a key-rotation boundary
+        // and at the last permitted position
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let (mut encryption, header) =
+            start_encryption(&test_key(), b"position boundaries", parameters).unwrap();
+        let before_rotation = encryption
+            .encrypt_segment_at(b"before", ROTATION_INTERVAL - 1, SegmentKind::Final)
+            .unwrap();
+        let after_rotation = encryption
+            .encrypt_segment_at(b"after", ROTATION_INTERVAL, SegmentKind::Final)
+            .unwrap();
+        let last_position = encryption
+            .encrypt_segment_at(b"last", AEAD_MAX_SEGMENTS - 1, SegmentKind::Final)
+            .unwrap();
+
+        // Then encryption past the segment limit is rejected
+        assert_eq!(
+            encryption.encrypt_segment_at(b"past", AEAD_MAX_SEGMENTS, SegmentKind::Final),
+            Err(Error::SegmentLimit)
+        );
+
+        // When each boundary segment is decrypted at its position
+        let mut decryption =
+            start_decryption(&test_key(), b"position boundaries", parameters, &header).unwrap();
+
+        // Then each round-trips across the rotation and limit boundaries,
+        // and decryption past the segment limit is rejected
+        assert_eq!(
+            decryption
+                .decrypt_segment_at(&before_rotation, ROTATION_INTERVAL - 1, SegmentKind::Final,)
+                .unwrap(),
+            b"before"
+        );
+        assert_eq!(
+            decryption
+                .decrypt_segment_at(&after_rotation, ROTATION_INTERVAL, SegmentKind::Final)
+                .unwrap(),
+            b"after"
+        );
+        assert_eq!(
+            decryption
+                .decrypt_segment_at(&last_position, AEAD_MAX_SEGMENTS - 1, SegmentKind::Final,)
+                .unwrap(),
+            b"last"
+        );
+        assert_eq!(
+            decryption.decrypt_segment_at(&last_position, AEAD_MAX_SEGMENTS, SegmentKind::Final,),
+            Err(Error::SegmentLimit)
+        );
+    }
+
+    #[test]
+    fn batched_nonces_remain_unique_across_refills() {
+        // Given more segments than one 64-nonce batch covers
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let plaintext = vec![0x5a; parameters.plaintext_segment_length()];
+        let mut encrypted = vec![0u8; parameters.ciphertext_segment_length()];
+        let (mut encryption, _) =
+            start_encryption(&test_key(), b"nonce batches", parameters).unwrap();
+        let mut nonces = HashSet::new();
+
+        for position in 0..130 {
+            // When each segment is encrypted
+            encryption
+                .encrypt_segment_into_at(
+                    &plaintext,
+                    position,
+                    SegmentKind::NonFinal,
+                    &mut encrypted,
+                )
+                .unwrap();
+
+            // Then the nonce embedded in the segment has never been used
+            let nonce: [u8; AEAD_IV_LENGTH] = encrypted
+                [SEGMENT_PREFIX_LENGTH..SEGMENT_PREFIX_LENGTH + AEAD_IV_LENGTH]
+                .try_into()
+                .unwrap();
+            assert!(
+                nonces.insert(nonce),
+                "nonce repeated at position {position}"
+            );
+        }
+    }
+
+    #[test]
+    fn segment_layouts_from_other_parameter_sets_rejected() {
+        // Given an encryption state and a segment layout calculated with a
+        // different parameter set
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let (mut encryption, _) = start_encryption(&test_key(), b"", parameters).unwrap();
+        let wrong_profile_segment = Parameters::SEGMENT_1_MIB
+            .plaintext_layout(3)
+            .unwrap()
+            .segment_for_position(0)
+            .unwrap();
+
+        // When a segment is encrypted with the mismatched layout
+        // Then the layout is rejected
+        assert_eq!(
+            encryption.encrypt_segment(b"abc", wrong_profile_segment),
+            Err(Error::InvalidParameters)
+        );
+    }
+
+    #[test]
+    fn plaintext_length_must_match_segment_layout() {
+        // Given a segment layout describing exactly three plaintext bytes
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let segment = parameters
+            .plaintext_layout(3)
+            .unwrap()
+            .segment_for_position(0)
+            .unwrap();
+        let (mut encryption, _) = start_encryption(&test_key(), b"", parameters).unwrap();
+
+        // When two bytes are encrypted against it
+        // Then the length mismatch is rejected
+        assert_eq!(
+            encryption.encrypt_segment(b"ab", segment),
+            Err(Error::InvalidPlaintextLength {
+                actual: 2,
+                required: LengthRequirement::Exactly(3),
+            })
+        );
+    }
+
+    #[test]
+    fn undersized_output_buffers_rejected_before_encryption() {
+        // Given an output buffer one byte smaller than the segment needs
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let segment = parameters
+            .plaintext_layout(3)
+            .unwrap()
+            .segment_for_position(0)
+            .unwrap();
+        let (mut encryption, _) = start_encryption(&test_key(), b"", parameters).unwrap();
+        let mut too_small = [0u8; SEGMENT_OVERHEAD + 2];
+
+        // When the segment is encrypted into it
+        // Then the buffer is rejected
+        assert!(matches!(
+            encryption.encrypt_segment_into(
+                b"abc",
+                segment,
+                &mut too_small[..SEGMENT_OVERHEAD + 2]
+            ),
+            Err(Error::OutputTooSmall { .. })
+        ));
+    }
+
+    #[test]
+    fn into_apis_write_exact_segment_lengths() {
+        // Given exactly sized caller-provided buffers on both sides
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let segment = parameters
+            .plaintext_layout(3)
+            .unwrap()
+            .segment_for_position(0)
+            .unwrap();
+        let (mut encryption, header) = start_encryption(&test_key(), b"", parameters).unwrap();
+
+        // When the segment is encrypted and decrypted through the into APIs
+        let mut encrypted = [0u8; SEGMENT_OVERHEAD + 3];
+        let encrypted_length = encryption
+            .encrypt_segment_into(b"abc", segment, &mut encrypted)
+            .unwrap();
+
+        // Then each call writes exactly the declared length and the
+        // plaintext round-trips
+        assert_eq!(encrypted_length, SEGMENT_OVERHEAD + 3);
+        let mut decryption = start_decryption(&test_key(), b"", parameters, &header).unwrap();
+        let mut plaintext = [0u8; 3];
+        assert_eq!(
+            decryption
+                .decrypt_segment_into(&encrypted[..encrypted_length], segment, &mut plaintext,)
+                .unwrap(),
+            3
+        );
+        assert_eq!(&plaintext, b"abc");
+    }
+
+    #[test]
+    fn segment_buffers_round_trip_in_place() {
+        // Given plaintext prepared in a reusable segment buffer
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let segment = parameters
+            .plaintext_layout(3)
+            .unwrap()
+            .segment_for_position(0)
+            .unwrap();
+        let (mut encryption, header) = start_encryption(&test_key(), b"", parameters).unwrap();
+        let mut in_place = SegmentBuffer::new(parameters);
+        in_place
+            .prepare_plaintext(3)
+            .unwrap()
+            .copy_from_slice(b"abc");
+
+        // When the buffer is encrypted and decrypted in place
+        assert_eq!(
+            encryption
+                .encrypt_segment_in_place(&mut in_place, segment)
+                .unwrap()
+                .len(),
+            SEGMENT_OVERHEAD + 3
+        );
+        let mut decryption = start_decryption(&test_key(), b"", parameters, &header).unwrap();
+
+        // Then the original plaintext is recovered without copying
+        assert_eq!(
+            decryption
+                .decrypt_segment_in_place(&mut in_place, segment)
+                .unwrap(),
+            b"abc"
+        );
+    }
+
+    #[test]
+    fn in_place_decryption_rejects_tampered_ciphertext() {
+        // Given an in-place encrypted segment whose last byte is flipped
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let segment = parameters
+            .plaintext_layout(3)
+            .unwrap()
+            .segment_for_position(0)
+            .unwrap();
+        let (mut encryption, header) = start_encryption(&test_key(), b"", parameters).unwrap();
+        let mut in_place = SegmentBuffer::new(parameters);
+        in_place
+            .prepare_plaintext(3)
+            .unwrap()
+            .copy_from_slice(b"abc");
+        encryption
+            .encrypt_segment_in_place(&mut in_place, segment)
+            .unwrap();
+
+        let mut tampered = SegmentBuffer::new(parameters);
+        tampered
+            .prepare_ciphertext(SEGMENT_OVERHEAD + 3)
+            .unwrap()
+            .copy_from_slice(in_place.ciphertext().unwrap());
+        *tampered
+            .prepare_ciphertext(SEGMENT_OVERHEAD + 3)
+            .unwrap()
+            .last_mut()
+            .unwrap() ^= 1;
+
+        // When the tampered buffer is decrypted in place
+        // Then authentication fails
+        let mut decryption = start_decryption(&test_key(), b"", parameters, &header).unwrap();
+        assert_eq!(
+            decryption.decrypt_segment_in_place(&mut tampered, segment),
+            Err(Error::AuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn segment_position_is_authenticated() {
+        // Given a segment encrypted at position five
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let (mut encryption, header) = start_encryption(&test_key(), b"", parameters).unwrap();
+        let segment_bytes = encryption
+            .encrypt_segment_at(b"data", 5, SegmentKind::Final)
+            .unwrap();
+
+        // When it is decrypted at position six
+        // Then authentication fails
+        let mut decryption = start_decryption(&test_key(), b"", parameters, &header).unwrap();
+        assert_eq!(
+            decryption.decrypt_segment_at(&segment_bytes, 6, SegmentKind::Final),
+            Err(Error::AuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn final_indicator_is_authenticated() {
+        // Given a final segment reframed with a non-final prefix and padded
+        // to the full segment length
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let (mut encryption, header) = start_encryption(&test_key(), b"", parameters).unwrap();
+        let segment_bytes = encryption
+            .encrypt_segment_at(b"data", 5, SegmentKind::Final)
+            .unwrap();
+        let mut forged_non_final = vec![0u8; parameters.ciphertext_segment_length()];
+        forged_non_final[..4].copy_from_slice(&u32::MAX.to_be_bytes());
+        forged_non_final[4..4 + segment_bytes.len() - 4].copy_from_slice(&segment_bytes[4..]);
+
+        // When it is decrypted as a non-final segment at its true position
+        // Then authentication fails
+        let mut decryption = start_decryption(&test_key(), b"", parameters, &header).unwrap();
+        assert_eq!(
+            decryption.decrypt_segment_at(&forged_non_final, 5, SegmentKind::NonFinal),
+            Err(Error::AuthenticationFailed)
+        );
+    }
+}

@@ -740,11 +740,8 @@ mod tests {
     use std::io::{Cursor, Read as _, Write as _};
 
     use super::*;
+    use crate::key::test_key;
     use crate::{decrypt, decrypt_with_parameters, encrypt, random_access};
-
-    fn key() -> Key {
-        Key::from_bytes_with_provider([0x5a; Key::LEN], crate::Provider::COMPILED[0])
-    }
 
     #[derive(Debug, Default)]
     struct FlushFails(Vec<u8>);
@@ -762,20 +759,26 @@ mod tests {
 
     #[test]
     fn encrypt_reader_round_trips_plaintext_boundaries() {
+        // Given plaintext lengths at and around the segment boundary
         let parameters = Parameters::SEGMENT_4_KIB;
         let capacity = parameters.plaintext_segment_length();
         for length in [0, 1, capacity - 1, capacity, capacity + 1, 2 * capacity] {
             let plaintext = vec![0x31; length];
+
+            // When the plaintext is pulled through an EncryptReader
             let mut reader =
-                EncryptReader::new(Cursor::new(&plaintext), &key(), b"io", parameters).unwrap();
+                EncryptReader::new(Cursor::new(&plaintext), &test_key(), b"io", parameters)
+                    .unwrap();
             let mut ciphertext = Vec::new();
             reader.read_to_end(&mut ciphertext).unwrap();
+
+            // Then the reader finishes and the ciphertext round-trips
             assert!(
                 reader.is_finished(),
                 "reader did not finish at length {length}"
             );
             assert_eq!(
-                decrypt(&key(), b"io", &ciphertext).unwrap(),
+                decrypt(&test_key(), b"io", &ciphertext).unwrap(),
                 plaintext,
                 "reader round trip failed at length {length}"
             );
@@ -783,41 +786,64 @@ mod tests {
     }
 
     #[test]
-    fn adapters_round_trip_and_consuming_finish_returns_inner() {
+    fn adapters_round_trip_across_parameter_sets() {
+        // Given a message longer than one segment, under each parameter set
         for parameters in [Parameters::SEGMENT_4_KIB, Parameters::SEGMENT_1_MIB] {
             let plaintext = vec![0x31; parameters.plaintext_segment_length() + 7];
-            let mut writer = EncryptWriter::new(Vec::new(), &key(), b"io", parameters).unwrap();
+
+            // When it is written through an EncryptWriter and read back
+            // through a DecryptReader
+            let mut writer =
+                EncryptWriter::new(Vec::new(), &test_key(), b"io", parameters).unwrap();
             writer.write_all(&plaintext).unwrap();
             let ciphertext = writer.finish().unwrap();
-
-            let mut reader = DecryptReader::new(Cursor::new(ciphertext), &key(), b"io").unwrap();
+            let mut reader =
+                DecryptReader::new(Cursor::new(ciphertext), &test_key(), b"io").unwrap();
             let mut recovered = Vec::new();
             reader.read_to_end(&mut recovered).unwrap();
-            assert_eq!(recovered, plaintext);
-            assert!(reader.is_finished());
 
-            let mut reader = DecryptReader::new(
-                Cursor::new(encrypt(&key(), b"io", parameters, &plaintext).unwrap()),
-                &key(),
-                b"io",
-            )
-            .unwrap();
-            reader.try_finish().unwrap();
+            // Then the plaintext round-trips and the reader finishes
+            assert_eq!(recovered, plaintext);
             assert!(reader.is_finished());
         }
     }
 
     #[test]
+    fn try_finish_verifies_complete_message_without_reading() {
+        // Given a reader over a complete valid ciphertext
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let plaintext = vec![0x31; parameters.plaintext_segment_length() + 7];
+        let mut reader = DecryptReader::new(
+            Cursor::new(encrypt(&test_key(), b"io", parameters, &plaintext).unwrap()),
+            &test_key(),
+            b"io",
+        )
+        .unwrap();
+
+        // When the remainder is verified without extracting plaintext
+        reader.try_finish().unwrap();
+
+        // Then the reader reaches the finished state
+        assert!(reader.is_finished());
+    }
+
+    #[test]
     fn writer_boundary_lengths_round_trip() {
+        // Given plaintext lengths at and around the segment boundary
         let parameters = Parameters::SEGMENT_4_KIB;
         let capacity = parameters.plaintext_segment_length();
         for length in [0, 1, capacity - 1, capacity, capacity + 1, 2 * capacity] {
             let plaintext = vec![0x32; length];
-            let mut writer = EncryptWriter::new(Vec::new(), &key(), b"io", parameters).unwrap();
+
+            // When the plaintext is written through an EncryptWriter
+            let mut writer =
+                EncryptWriter::new(Vec::new(), &test_key(), b"io", parameters).unwrap();
             writer.write_all(&plaintext).unwrap();
             let ciphertext = writer.finish().unwrap();
+
+            // Then the finished ciphertext round-trips
             assert_eq!(
-                decrypt(&key(), b"io", &ciphertext).unwrap(),
+                decrypt(&test_key(), b"io", &ciphertext).unwrap(),
                 plaintext,
                 "writer round trip failed at length {length}"
             );
@@ -826,52 +852,63 @@ mod tests {
 
     #[test]
     fn writer_flush_does_not_emit_partial_segment() {
+        // Given a writer holding buffered, unfinalized plaintext
         let mut writer =
-            EncryptWriter::new(Vec::new(), &key(), b"io", Parameters::SEGMENT_4_KIB).unwrap();
+            EncryptWriter::new(Vec::new(), &test_key(), b"io", Parameters::SEGMENT_4_KIB).unwrap();
         writer.write_all(b"buffered plaintext").unwrap();
+
+        // When the writer is flushed before finish
         writer.flush().unwrap();
+
+        // Then only the header has been emitted
         assert_eq!(writer.get_ref().len(), Header::LEN);
 
+        // Then finishing still produces a complete round-trippable message
         let ciphertext = writer.finish().unwrap();
         assert_eq!(
-            decrypt(&key(), b"io", &ciphertext).unwrap(),
+            decrypt(&test_key(), b"io", &ciphertext).unwrap(),
             b"buffered plaintext"
         );
     }
 
     #[test]
-    fn frame_finish_preserves_trailing_data_and_default_finish_rejects_it() {
+    fn frame_finish_preserves_trailing_data() {
+        // Given a stream holding one complete message followed by more data
         let parameters = Parameters::SEGMENT_4_KIB;
-        let ciphertext = {
-            let mut writer = EncryptWriter::new(Vec::new(), &key(), b"io", parameters).unwrap();
-            writer.write_all(b"message").unwrap();
-            writer.finish().unwrap()
-        };
-        let mut framed = ciphertext.clone();
+        let mut writer = EncryptWriter::new(Vec::new(), &test_key(), b"io", parameters).unwrap();
+        writer.write_all(b"message").unwrap();
+        let mut framed = writer.finish().unwrap();
         framed.extend_from_slice(b"next frame");
 
-        let mut reader = DecryptReader::new(Cursor::new(framed), &key(), b"io").unwrap();
+        // When the message is read and finished as a frame
+        let mut reader = DecryptReader::new(Cursor::new(framed), &test_key(), b"io").unwrap();
         let mut plaintext = Vec::new();
         reader.read_to_end(&mut plaintext).unwrap();
         assert_eq!(plaintext, b"message");
         let inner = reader.finish_frame().unwrap();
+
+        // Then the inner reader is positioned exactly at the trailing data
         assert_eq!(
             &inner.get_ref()[usize::try_from(inner.position()).unwrap()..],
             b"next frame"
         );
+    }
 
-        let mut reader = DecryptReader::new(
-            Cursor::new({
-                let mut bytes = ciphertext;
-                bytes.push(0);
-                bytes
-            }),
-            &key(),
-            b"io",
-        )
-        .unwrap();
+    #[test]
+    fn default_finish_rejects_trailing_data() {
+        // Given a stream holding one complete message plus one extra byte
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let mut writer = EncryptWriter::new(Vec::new(), &test_key(), b"io", parameters).unwrap();
+        writer.write_all(b"message").unwrap();
+        let mut bytes = writer.finish().unwrap();
+        bytes.push(0);
+
+        // When the message is read and finished with the whole-stream API
+        let mut reader = DecryptReader::new(Cursor::new(bytes), &test_key(), b"io").unwrap();
         let mut plaintext = Vec::new();
         reader.read_to_end(&mut plaintext).unwrap();
+
+        // Then the unconsumed trailing byte is rejected
         assert_eq!(
             reader.finish().unwrap_err().error().kind(),
             io::ErrorKind::InvalidData
@@ -880,16 +917,22 @@ mod tests {
 
     #[test]
     fn consuming_reader_finish_error_preserves_wrapped_reader() {
+        // Given a reader over a ciphertext missing its final byte
         let mut ciphertext = {
             let mut writer =
-                EncryptWriter::new(Vec::new(), &key(), b"io", Parameters::SEGMENT_4_KIB).unwrap();
+                EncryptWriter::new(Vec::new(), &test_key(), b"io", Parameters::SEGMENT_4_KIB)
+                    .unwrap();
             writer.write_all(b"message").unwrap();
             writer.finish().unwrap()
         };
         ciphertext.pop();
+        let reader = DecryptReader::new(Cursor::new(ciphertext), &test_key(), b"io").unwrap();
 
-        let reader = DecryptReader::new(Cursor::new(ciphertext), &key(), b"io").unwrap();
+        // When the consuming finish fails
         let failure = reader.finish().unwrap_err();
+
+        // Then the error is classified and the wrapped reader is returned
+        // intact
         assert_eq!(failure.error().kind(), io::ErrorKind::InvalidData);
         let inner = failure.into_inner();
         assert!(inner.position() >= u64::try_from(Header::LEN).unwrap());
@@ -897,11 +940,17 @@ mod tests {
 
     #[test]
     fn reader_constructors_classify_short_headers_consistently() {
+        // Given inputs shorter than a complete header
         for length in 0..Header::LEN {
             let input = vec![0u8; length];
-            let stream_error = DecryptReader::new(Cursor::new(&input), &key(), b"io").unwrap_err();
+
+            // When each reader constructor parses the input
+            let stream_error =
+                DecryptReader::new(Cursor::new(&input), &test_key(), b"io").unwrap_err();
             let random_error =
-                random_access::Reader::new(Cursor::new(&input), &key(), b"io").unwrap_err();
+                random_access::Reader::new(Cursor::new(&input), &test_key(), b"io").unwrap_err();
+
+            // Then both classify the short header identically
             for error in [stream_error, random_error] {
                 assert_eq!(error.kind(), io::ErrorKind::InvalidData);
                 assert!(matches!(
@@ -916,48 +965,70 @@ mod tests {
 
     #[test]
     fn unfinished_extraction_is_explicit_and_truncated() {
+        // Given a writer that has emitted no final segment
         let writer =
-            EncryptWriter::new(Vec::new(), &key(), b"io", Parameters::SEGMENT_4_KIB).unwrap();
+            EncryptWriter::new(Vec::new(), &test_key(), b"io", Parameters::SEGMENT_4_KIB).unwrap();
+
+        // When its inner buffer is extracted through the explicit
+        // unfinished API
         let ciphertext = writer.into_inner_unfinished();
-        assert_eq!(decrypt(&key(), b"io", &ciphertext), Err(Error::Truncated));
+
+        // Then the extracted bytes decrypt as a truncated message
+        assert_eq!(
+            decrypt(&test_key(), b"io", &ciphertext),
+            Err(Error::Truncated)
+        );
     }
 
     #[test]
     fn consuming_finish_error_preserves_wrapped_writer() {
+        // Given a writer whose inner sink fails on flush
         let mut writer = EncryptWriter::new(
             FlushFails::default(),
-            &key(),
+            &test_key(),
             b"io",
             Parameters::SEGMENT_4_KIB,
         )
         .unwrap();
         writer.write_all(b"message").unwrap();
 
+        // When the consuming finish fails
         let error = writer.finish().unwrap_err();
+
+        // Then the error is classified and the wrapped sink is returned
+        // with the bytes it accepted
         assert_eq!(error.error().kind(), io::ErrorKind::Other);
         assert!(!error.into_inner().0.is_empty());
     }
 
     #[test]
     fn finish_error_does_not_require_inner_type_to_implement_debug() {
+        // Given a wrapped type without a Debug implementation
         struct NoDebug;
 
+        // Then FinishError still implements the standard Error trait
         fn assert_error<T: std::error::Error>() {}
         assert_error::<FinishError<NoDebug>>();
     }
 
     #[test]
     fn parameter_policy_checkable_after_construction() {
+        // Given a message written with the 1 MiB profile
         let parameters = Parameters::SEGMENT_1_MIB;
-        let mut writer = EncryptWriter::new(Vec::new(), &key(), b"io", parameters).unwrap();
+        let mut writer = EncryptWriter::new(Vec::new(), &test_key(), b"io", parameters).unwrap();
         writer.write_all(b"message").unwrap();
         let ciphertext = writer.finish().unwrap();
+
+        // When the profile is demanded explicitly during whole-message
+        // decryption, then the message decrypts
         assert_eq!(
-            decrypt_with_parameters(&key(), b"io", parameters, &ciphertext).unwrap(),
+            decrypt_with_parameters(&test_key(), b"io", parameters, &ciphertext).unwrap(),
             b"message"
         );
 
-        let reader = DecryptReader::new(Cursor::new(ciphertext), &key(), b"io").unwrap();
+        // When a streaming reader is constructed, then the authenticated
+        // parameters are available for a policy check
+        let reader = DecryptReader::new(Cursor::new(ciphertext), &test_key(), b"io").unwrap();
         assert_eq!(reader.parameters(), parameters);
     }
 }
