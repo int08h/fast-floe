@@ -318,7 +318,7 @@ Provider choice does not change the FLOE wire format. They are all compatible wi
 To use an alternate provider:
 
 ```toml
-fast-floe = { version = "0.1", default-features = false, features = ["ring"] }
+fast-floe = { version = "0.3", default-features = false, features = ["ring"] }
 ```
 
 Provider features are additive. With exactly one compiled provider,
