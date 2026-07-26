@@ -143,10 +143,17 @@ mod tests {
 
     #[test]
     fn implicit_keys_resolve_only_for_single_provider_builds() {
+        // Given a key imported without naming a provider
         let key = Key::from_bytes([0x21; Key::LEN]);
+
         if let Some(provider) = Provider::build_default() {
+            // When exactly one provider is compiled into this build
+
+            // Then imported and generated keys resolve to it implicitly
             assert_eq!(key.provider(), Ok(provider));
             assert_eq!(Key::generate().unwrap().provider(), Ok(provider));
+
+            // Then the implicitly resolved key round-trips a message
             let ciphertext = encrypt(
                 &key,
                 b"implicit provider",
@@ -159,6 +166,9 @@ mod tests {
                 b"message"
             );
         } else {
+            // When multiple providers are compiled into this build
+
+            // Then resolution and generation demand an explicit provider
             assert_eq!(key.provider(), Err(Error::ProviderSelectionRequired));
             assert!(matches!(
                 Key::generate(),
@@ -169,7 +179,10 @@ mod tests {
 
     #[test]
     fn generated_keys_have_required_size() {
+        // Given every provider compiled into this build
         for &provider in Provider::COMPILED {
+            // When the provider generates a key
+            // Then the key is exactly Key::LEN bytes
             assert_eq!(
                 Key::generate_with_provider(provider)
                     .unwrap()

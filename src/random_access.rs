@@ -474,8 +474,7 @@ mod tests {
     use crate::key::test_key;
     use crate::{Parameters, encrypt};
 
-    #[test]
-    fn reads_segment_ranges_without_decrypting_complete_message() {
+    fn framed_reader_fixture() -> (Reader<Cursor<Vec<u8>>>, Vec<u8>, Parameters) {
         let key = test_key();
         let parameters = Parameters::SEGMENT_4_KIB;
         let plaintext: Vec<u8> = (0..2 * parameters.plaintext_segment_length() + 37)
@@ -486,18 +485,30 @@ mod tests {
         framed.extend_from_slice(&ciphertext);
         let mut cursor = Cursor::new(framed);
         cursor.set_position(3);
+        let reader = Reader::new(cursor, &key, b"random reader").unwrap();
+        (reader, plaintext, parameters)
+    }
 
-        let mut reader = Reader::new(cursor, &key, b"random reader").unwrap();
+    #[test]
+    fn reads_individual_segments_without_decrypting_complete_message() {
+        // Given a reader over a three-segment message that starts mid-stream
+        let (mut reader, plaintext, parameters) = framed_reader_fixture();
         assert_eq!(reader.parameters(), parameters);
         assert_eq!(
             reader.plaintext_length(),
             u64::try_from(plaintext.len()).unwrap()
         );
+
+        // When the middle segment is read by position
+        // Then exactly that segment's plaintext is returned
         assert_eq!(
             reader.read_segment(1).unwrap(),
             plaintext
                 [parameters.plaintext_segment_length()..2 * parameters.plaintext_segment_length()]
         );
+
+        // When it is read into a caller-provided buffer
+        // Then the same bytes are written at the declared length
         let mut segment_output = vec![0; parameters.plaintext_segment_length()];
         assert_eq!(
             reader.read_segment_into(1, &mut segment_output).unwrap(),
@@ -508,11 +519,21 @@ mod tests {
             plaintext
                 [parameters.plaintext_segment_length()..2 * parameters.plaintext_segment_length()]
         );
+
+        // When the buffer is too small, then the read is rejected
         assert_eq!(
             reader.read_segment_into(1, &mut []).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
+    }
 
+    #[test]
+    fn reads_arbitrary_ranges_across_segment_boundaries() {
+        // Given a reader over a three-segment message that starts mid-stream
+        let (mut reader, plaintext, parameters) = framed_reader_fixture();
+
+        // When a range straddling a segment boundary is read
+        // Then exactly the requested bytes are returned
         let range =
             parameters.plaintext_segment_length() - 11..parameters.plaintext_segment_length() + 19;
         let range = u64::try_from(range.start).unwrap()..u64::try_from(range.end).unwrap();
@@ -521,6 +542,8 @@ mod tests {
             plaintext[usize::try_from(range.start).unwrap()..usize::try_from(range.end).unwrap()]
         );
 
+        // When every open and closed range form is read
+        // Then each resolves against the plaintext length.
         // A range spanning a fully covered middle segment exercises the
         // direct-into-output path together with both cached edges.
         let full = reader.read_range(..).unwrap();
@@ -533,6 +556,7 @@ mod tests {
 
     #[test]
     fn read_and_seek_provide_authenticated_plaintext_view() {
+        // Given a reader over a message spanning three segments
         let key = test_key();
         let parameters = Parameters::SEGMENT_4_KIB;
         let segment_length = parameters.plaintext_segment_length();
@@ -540,35 +564,58 @@ mod tests {
             .map(|position| u8::try_from(position % 249).unwrap())
             .collect();
         let ciphertext = encrypt(&key, b"seekable", parameters, &plaintext).unwrap();
-
         let mut reader = Reader::new(Cursor::new(ciphertext), &key, b"seekable").unwrap();
+
+        // When the whole view is streamed with the Read implementation
         let mut streamed = Vec::new();
         reader.read_to_end(&mut streamed).unwrap();
+
+        // Then the complete plaintext is produced
         assert_eq!(streamed, plaintext);
 
+        // When the reader seeks from the start and reads a chunk
         let offset = u64::try_from(segment_length + 100).unwrap();
         assert_eq!(reader.seek(SeekFrom::Start(offset)).unwrap(), offset);
         let mut chunk = [0u8; 64];
         reader.read_exact(&mut chunk).unwrap();
+
+        // Then the chunk matches the plaintext at that offset
         let start = usize::try_from(offset).unwrap();
         assert_eq!(chunk, plaintext[start..start + 64]);
 
+        // When the reader seeks from the end and reads to the end
         assert_eq!(
             reader.seek(SeekFrom::End(-8)).unwrap(),
             u64::try_from(plaintext.len() - 8).unwrap()
         );
         let mut tail = Vec::new();
         reader.read_to_end(&mut tail).unwrap();
-        assert_eq!(tail, plaintext[plaintext.len() - 8..]);
 
-        // Seeking past the end reads as end-of-stream, and negative seeks
-        // from the current position are rejected.
+        // Then exactly the plaintext tail is produced
+        assert_eq!(tail, plaintext[plaintext.len() - 8..]);
+    }
+
+    #[test]
+    fn seeks_past_end_read_as_empty_and_negative_seeks_rejected() {
+        // Given a seekable reader over a short message
+        let key = test_key();
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let plaintext = b"seek boundaries";
+        let ciphertext = encrypt(&key, b"seekable", parameters, plaintext).unwrap();
+        let mut reader = Reader::new(Cursor::new(ciphertext), &key, b"seekable").unwrap();
+
+        // When the reader seeks past the end of the plaintext
         reader
             .seek(SeekFrom::Start(u64::try_from(plaintext.len() + 1).unwrap()))
             .unwrap();
+
+        // Then reading produces end-of-stream rather than an error
         let mut empty = Vec::new();
         reader.read_to_end(&mut empty).unwrap();
         assert!(empty.is_empty());
+
+        // When the reader seeks before position zero
+        // Then the seek is rejected
         reader.seek(SeekFrom::Start(0)).unwrap();
         assert_eq!(
             reader.seek(SeekFrom::Current(-1)).unwrap_err().kind(),
@@ -579,6 +626,7 @@ mod tests {
     #[test]
     #[allow(clippy::reversed_empty_ranges)] // deliberately invalid range input
     fn rejects_invalid_ranges_and_supports_a_parameter_policy_check() {
+        // Given a reader over a single-segment message
         let key = test_key();
         let ciphertext = encrypt(
             &key,
@@ -587,9 +635,13 @@ mod tests {
             b"plaintext",
         )
         .unwrap();
-
         let mut reader = Reader::new(Cursor::new(ciphertext), &key, b"random reader").unwrap();
+
+        // Then the authenticated parameters are available for a policy check
         assert_ne!(reader.parameters(), Parameters::SEGMENT_1_MIB);
+
+        // When a range beyond the plaintext or a reversed range is read
+        // Then each is rejected as invalid input
         assert_eq!(
             reader.read_range(0..u64::MAX).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
@@ -602,23 +654,31 @@ mod tests {
 
     #[test]
     fn construction_authenticates_complete_message_tail() {
+        // Given a valid two-segment ciphertext
         let key = test_key();
         let parameters = Parameters::SEGMENT_4_KIB;
         let plaintext = vec![0x5a; parameters.plaintext_segment_length() + 19];
         let ciphertext = encrypt(&key, b"random reader", parameters, &plaintext).unwrap();
 
+        // When a reader is constructed over every truncation of it
         for length in 0..ciphertext.len() {
             let truncated = &ciphertext[..length];
+
+            // Then construction rejects the incomplete message up front
             assert!(
                 Reader::new(Cursor::new(truncated), &key, b"random reader").is_err(),
                 "constructor accepted truncation at {length}"
             );
         }
 
+        // When one byte is appended to the complete message
+        // Then construction rejects the trailing data
         let mut appended = ciphertext.clone();
         appended.push(0);
         assert!(Reader::new(Cursor::new(appended), &key, b"random reader").is_err());
 
+        // When the final segment's length prefix understates its length
+        // Then construction rejects the forged tail
         let layout = parameters
             .ciphertext_layout(u64::try_from(ciphertext.len()).unwrap())
             .unwrap();
@@ -635,6 +695,7 @@ mod tests {
 
     #[test]
     fn bounded_constructor_preserves_following_frame() {
+        // Given a stream holding a complete message between unrelated bytes
         let key = test_key();
         let parameters = Parameters::SEGMENT_4_KIB;
         let plaintext = b"bounded random access";
@@ -644,10 +705,14 @@ mod tests {
         framed.extend_from_slice(&ciphertext);
         framed.extend_from_slice(b"next frame");
 
+        // When a reader is constructed with the message's explicit length
         let mut cursor = Cursor::new(framed.clone());
         cursor.set_position(3);
         let mut reader =
             Reader::new_with_length(cursor, &key, b"random reader", ciphertext_length).unwrap();
+
+        // Then the bounded message reads fully and the inner reader stops
+        // exactly at the following frame
         assert_eq!(reader.parameters(), parameters);
         assert_eq!(
             reader.read_range(0..plaintext.len() as u64).unwrap(),
@@ -657,10 +722,14 @@ mod tests {
         let position = usize::try_from(inner.position()).unwrap();
         assert_eq!(&inner.get_ref()[position..], b"next frame");
 
+        // When the unbounded constructor sees the same stream
+        // Then the trailing frame makes construction fail
         let mut cursor = Cursor::new(framed);
         cursor.set_position(3);
         assert!(Reader::new(cursor, &key, b"random reader").is_err());
 
+        // When the declared bound cannot hold a complete header
+        // Then construction fails
         assert!(
             Reader::new_with_length(
                 Cursor::new(vec![0; Header::LEN]),

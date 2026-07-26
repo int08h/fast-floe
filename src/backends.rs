@@ -659,8 +659,13 @@ mod tests {
 
     #[test]
     fn providers_construct_only_fixed_rng() {
+        // Given every provider compiled into this build
         for &provider in Provider::COMPILED {
+            // When the provider constructs its random generator
             let rng = ProviderRng::new(provider);
+
+            // Then it is the provider's single fixed generator; the
+            // rustcrypto provider always uses ChaCha12
             let expected = if provider.name() == "rustcrypto" {
                 "chacha12"
             } else {

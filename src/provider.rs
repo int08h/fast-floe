@@ -87,6 +87,7 @@ mod tests {
 
     #[test]
     fn compiled_providers_match_features() {
+        // Given the provider set selected by this build's feature flags
         let expected = &[
             #[cfg(feature = "aws-lc-rs")]
             Provider::AWS_LC_RS,
@@ -97,7 +98,11 @@ mod tests {
             #[cfg(feature = "rustcrypto")]
             Provider::RUSTCRYPTO,
         ];
+
+        // Then the compiled provider list matches those features exactly
         assert_eq!(Provider::COMPILED, expected);
+
+        // Then every provider reports its stable identifier
         assert_eq!(
             Provider::COMPILED
                 .iter()
@@ -114,6 +119,8 @@ mod tests {
                 "rustcrypto",
             ]
         );
+
+        // Then a build default exists only when exactly one provider is compiled
         assert_eq!(
             Provider::build_default(),
             (Provider::COMPILED.len() == 1).then_some(Provider::COMPILED[0])

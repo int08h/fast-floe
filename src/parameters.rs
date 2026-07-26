@@ -626,6 +626,10 @@ mod tests {
 
     #[test]
     fn parameter_encoding_matches_specification() {
+        // Given the specification's encodings of the fixed parameter sets
+
+        // Then each constant encodes to the specified bytes and reports the
+        // specified segment length
         assert_eq!(
             Parameters::SEGMENT_4_KIB.encode(),
             hex::decode("00000000100000000020").unwrap().as_slice()
@@ -645,7 +649,9 @@ mod tests {
     }
 
     #[test]
-    fn parameters_accept_exactly_valid_segment_lengths() {
+    fn parameters_accept_every_valid_segment_length() {
+        // Given segment lengths across the supported range, including both
+        // endpoints
         let valid_range = Parameters::VALID_SEGMENT_LENGTHS;
         let first_valid = valid_range.start;
         let last_valid = valid_range.end - 1;
@@ -661,21 +667,38 @@ mod tests {
         ] {
             assert!(valid_range.contains(&segment_length));
 
+            // When parameters are constructed from the segment length
             let parameters = Parameters::from_segment_length(segment_length).unwrap();
+
+            // Then they report that length and survive an encode/decode
+            // round trip
             assert_eq!(
                 parameters.ciphertext_segment_length(),
                 usize::try_from(segment_length).unwrap()
             );
             assert_eq!(Parameters::decode(parameters.encode()), Ok(parameters));
         }
+    }
+
+    #[test]
+    fn parameters_reject_segment_lengths_outside_valid_range() {
+        // Given segment lengths just outside the supported range and at the
+        // u32 extremes
+        let valid_range = Parameters::VALID_SEGMENT_LENGTHS;
+        let first_valid = valid_range.start;
 
         for segment_length in [0, first_valid - 1, valid_range.end, u32::MAX] {
             assert!(!valid_range.contains(&segment_length));
+
+            // When parameters are constructed from the segment length
+            // Then construction is rejected
             assert_eq!(
                 Parameters::from_segment_length(segment_length),
                 Err(Error::InvalidParameters)
             );
 
+            // When the length is spliced into an otherwise valid encoding
+            // Then decoding is rejected as well
             let mut encoded = Parameters::SEGMENT_4_KIB.encode();
             encoded[2..6].copy_from_slice(&segment_length.to_be_bytes());
             assert!(Parameters::decode(encoded).is_err());
@@ -684,6 +707,7 @@ mod tests {
 
     #[test]
     fn message_layouts_cover_plaintext_boundaries() {
+        // Given plaintext lengths at and around every segment boundary
         let parameters = Parameters::SEGMENT_4_KIB;
         let plaintext_segment_length =
             u64::try_from(parameters.plaintext_segment_length()).unwrap();
@@ -701,12 +725,16 @@ mod tests {
             2 * plaintext_segment_length,
             2 * plaintext_segment_length + 7,
         ] {
+            // When the message layout is calculated from the plaintext length
             let layout = parameters.plaintext_layout(plaintext_length).unwrap();
             let expected_count = if plaintext_length == 0 {
                 1
             } else {
                 (plaintext_length - 1) / plaintext_segment_length + 1
             };
+
+            // Then the layout reports the expected lengths and segment count,
+            // and the ciphertext length maps back to the same layout
             assert_eq!(layout.parameters(), parameters);
             assert_eq!(layout.plaintext_length(), plaintext_length);
             assert_eq!(layout.segment_count(), expected_count);
@@ -721,6 +749,7 @@ mod tests {
                 layout
             );
 
+            // Then iteration, indexed access, and reverse iteration agree
             let segments: Vec<_> = layout.segments().collect();
             assert_eq!(u64::try_from(segments.len()).unwrap(), expected_count);
             assert_eq!(layout.into_iter().collect::<Vec<_>>(), segments);
@@ -729,6 +758,8 @@ mod tests {
                 layout.segment_for_position(expected_count - 1)
             );
 
+            // Then every segment carries consistent offsets, lengths, and
+            // exactly the last position is final
             for segment in segments {
                 let position = segment.position();
                 assert_eq!(Some(segment), layout.segment_for_position(position));
@@ -755,19 +786,26 @@ mod tests {
                     }
                 );
             }
+
+            // Then positions beyond the message resolve to no segment
             assert_eq!(layout.segment_for_position(layout.segment_count()), None);
         }
     }
 
     #[test]
-    fn message_layouts_enforce_length_and_segment_limits() {
+    fn message_layouts_enforce_segment_limit() {
+        // Given the largest plaintext the specification's segment limit allows
         let parameters = Parameters::SEGMENT_4_KIB;
         let plaintext_segment_length =
             u64::try_from(parameters.plaintext_segment_length()).unwrap();
         let maximum_plaintext_length = AEAD_MAX_SEGMENTS * plaintext_segment_length;
+
+        // When its layout is calculated
         let maximum = parameters
             .plaintext_layout(maximum_plaintext_length)
             .unwrap();
+
+        // Then the layout fills the limit exactly and ends with a final segment
         assert_eq!(maximum.segment_count(), AEAD_MAX_SEGMENTS);
         assert!(
             maximum
@@ -775,6 +813,9 @@ mod tests {
                 .unwrap()
                 .is_final()
         );
+
+        // When one more byte is added on either the plaintext or ciphertext
+        // side, then the segment limit rejects the layout
         assert_eq!(
             parameters.plaintext_layout(maximum_plaintext_length + 1),
             Err(Error::SegmentLimit)
@@ -783,21 +824,39 @@ mod tests {
             parameters.ciphertext_layout(maximum.ciphertext_length() + 1),
             Err(Error::SegmentLimit)
         );
+    }
 
+    #[test]
+    fn ciphertext_layouts_classify_short_lengths() {
+        // Given ciphertext lengths around the header and minimum-segment
+        // boundaries
+        let parameters = Parameters::SEGMENT_4_KIB;
         let header_length = u64::try_from(HEADER_LENGTH).unwrap();
         let overhead = u64::try_from(SEGMENT_OVERHEAD).unwrap();
+
+        // When a length cannot hold a complete header,
+        // then it is classified as an invalid header length
         assert!(matches!(
             parameters.ciphertext_layout(header_length - 1),
             Err(Error::InvalidHeaderLength { .. })
         ));
+
+        // When a length holds the header but no body,
+        // then it is classified as truncated
         assert_eq!(
             parameters.ciphertext_layout(header_length),
             Err(Error::Truncated)
         );
+
+        // When the body cannot hold a minimum final segment,
+        // then the segment length is rejected
         assert!(matches!(
             parameters.ciphertext_layout(header_length + overhead - 1),
             Err(Error::InvalidCiphertextLength { .. })
         ));
+
+        // When the body holds exactly an empty final segment,
+        // then the layout matches the empty message
         assert_eq!(
             parameters
                 .ciphertext_layout(header_length + overhead)
@@ -808,6 +867,8 @@ mod tests {
 
     #[test]
     fn ciphertext_layout_accepts_length_valid_empty_final_segment() {
+        // Given a ciphertext length implying one full segment plus an empty
+        // final segment, a framing the canonical encoder never produces
         let parameters = Parameters::SEGMENT_4_KIB;
         let header_length = u64::try_from(HEADER_LENGTH).unwrap();
         let ciphertext_segment_length =
@@ -815,7 +876,10 @@ mod tests {
         let overhead = u64::try_from(SEGMENT_OVERHEAD).unwrap();
         let ciphertext_length = header_length + ciphertext_segment_length + overhead;
 
+        // When the layout is calculated from that ciphertext length
         let layout = parameters.ciphertext_layout(ciphertext_length).unwrap();
+
+        // Then it describes a full non-final segment and an empty final one
         assert_eq!(layout.segment_count(), 2);
         assert_eq!(
             layout.plaintext_length(),
@@ -838,6 +902,8 @@ mod tests {
         assert_eq!(final_segment.plaintext_length(), 0);
         assert_eq!(final_segment.ciphertext_length(), SEGMENT_OVERHEAD);
 
+        // Then the canonical layout for the same plaintext differs, proving
+        // this framing is an accepted alternative rather than the default
         let canonical = parameters
             .plaintext_layout(layout.plaintext_length())
             .unwrap();
@@ -846,9 +912,14 @@ mod tests {
     }
 
     #[test]
-    fn segment_prefix_classification_exposes_valid_framing() {
+    fn segment_prefixes_classify_final_and_non_final_framing() {
+        // Given the all-ones non-final prefix
         let parameters = Parameters::SEGMENT_4_KIB;
+
+        // When it is decoded
         let non_final = SegmentFraming::decode(parameters, u32::MAX.to_be_bytes()).unwrap();
+
+        // Then it classifies as a full non-final segment
         assert_eq!(non_final.kind(), SegmentKind::NonFinal);
         assert!(!non_final.is_final());
         assert_eq!(
@@ -860,13 +931,17 @@ mod tests {
             parameters.plaintext_segment_length()
         );
 
+        // Given final-segment lengths across the permitted range
         for encrypted_length in [
             SEGMENT_OVERHEAD,
             SEGMENT_OVERHEAD + 7,
             parameters.ciphertext_segment_length(),
         ] {
+            // When the length prefix is decoded
             let prefix = u32::try_from(encrypted_length).unwrap().to_be_bytes();
             let final_segment = SegmentFraming::decode(parameters, prefix).unwrap();
+
+            // Then it classifies as a final segment of exactly that length
             assert_eq!(final_segment.kind(), SegmentKind::Final);
             assert!(final_segment.is_final());
             assert_eq!(final_segment.ciphertext_length(), encrypted_length);
@@ -875,27 +950,36 @@ mod tests {
                 encrypted_length - SEGMENT_OVERHEAD
             );
         }
+    }
 
+    #[test]
+    fn segment_framing_rejects_lengths_outside_final_range() {
+        // Given prefixes just below the minimum and just above the maximum
+        // final-segment length
+        let parameters = Parameters::SEGMENT_4_KIB;
         for invalid in [
             SEGMENT_OVERHEAD - 1,
             parameters.ciphertext_segment_length() + 1,
         ] {
+            // When the prefix is decoded
+            // Then the declared length is rejected
             let prefix = u32::try_from(invalid).unwrap().to_be_bytes();
             assert!(matches!(
                 SegmentFraming::decode(parameters, prefix),
                 Err(Error::InvalidCiphertextLength { .. })
             ));
         }
-        assert_eq!(
-            SEGMENT_PAYLOAD_OFFSET,
-            SEGMENT_PREFIX_LENGTH + AEAD_IV_LENGTH
-        );
     }
 
     #[test]
     fn segment_framing_rejects_prefix_whose_low_bits_look_valid() {
+        // Given forged prefixes whose low bytes alone would decode to a
+        // valid final-segment length
         let parameters = Parameters::SEGMENT_4_KIB;
         for forged in [69_632_u32, 1_048_576 + 4_096] {
+            // When the full 32-bit prefix is decoded
+            // Then the forgery is rejected rather than truncated to its
+            // low bits
             assert!(matches!(
                 SegmentFraming::decode(parameters, forged.to_be_bytes()),
                 Err(Error::InvalidCiphertextLength { .. })
@@ -904,10 +988,24 @@ mod tests {
     }
 
     #[test]
+    fn segment_payload_offset_follows_prefix_and_nonce() {
+        // Given the specification's segment framing
+        // Then the payload begins directly after the length prefix and nonce
+        assert_eq!(
+            SEGMENT_PAYLOAD_OFFSET,
+            SEGMENT_PREFIX_LENGTH + AEAD_IV_LENGTH
+        );
+    }
+
+    #[test]
     fn masked_positions_rotate_at_specification_interval() {
         const ROTATION_INTERVAL: u64 = 1 << 20;
 
+        // Given the specification's key-rotation interval
         let parameters = Parameters::SEGMENT_4_KIB;
+
+        // Then positions mask to the interval boundary below them, up to the
+        // segment limit
         assert_eq!(parameters.masked_position(ROTATION_INTERVAL - 1), 0);
         assert_eq!(
             parameters.masked_position(ROTATION_INTERVAL),

@@ -15,8 +15,11 @@ const KAT_AAD: &[u8] = b"This is AAD";
 
 #[test]
 fn explicit_provider_preserved_by_keys_and_states() {
+    // Given a key explicitly bound to each compiled provider
     for &provider in Provider::COMPILED {
         let key = Key::from_bytes_with_provider([0x32; Key::LEN], provider);
+
+        // Then the key, its clones, and generated keys keep that binding
         assert_eq!(key.provider(), Ok(provider));
         assert_eq!(key.clone().provider(), Ok(provider));
         assert_eq!(
@@ -24,6 +27,9 @@ fn explicit_provider_preserved_by_keys_and_states() {
             Ok(provider)
         );
 
+        // When every state type is constructed from the key
+        // Then each reports the same provider, including through shared
+        // contexts and their forks
         let parameters = Parameters::SEGMENT_4_KIB;
         let encryptor = Encryptor::new(&key, b"provider identity", parameters).unwrap();
         assert_eq!(encryptor.provider(), provider);
@@ -49,6 +55,7 @@ fn explicit_provider_preserved_by_keys_and_states() {
 
 #[test]
 fn verify_providers_interoperate() {
+    // Given a message encrypted by each compiled provider
     let plaintext = b"provider-independent FLOE ciphertext";
     for &encrypt_provider in Provider::COMPILED {
         let encrypt_key = Key::from_bytes_with_provider([0x43; Key::LEN], encrypt_provider);
@@ -60,8 +67,11 @@ fn verify_providers_interoperate() {
         )
         .unwrap();
 
+        // When every compiled provider decrypts the same ciphertext
         for &decrypt_provider in Provider::COMPILED {
             let decrypt_key = Key::from_bytes_with_provider([0x43; Key::LEN], decrypt_provider);
+
+            // Then each recovers the plaintext
             assert_eq!(
                 decrypt(&decrypt_key, b"cross-provider", &ciphertext).unwrap(),
                 plaintext,
@@ -75,13 +85,16 @@ fn verify_providers_interoperate() {
 
 #[test]
 fn ambiguous_keys_fail_from_every_entry_layer() {
+    // Given a multi-provider build and a key with no explicit provider
     if Provider::build_default().is_some() {
         return;
     }
-
     let key = Key::from_bytes([0; Key::LEN]);
     let parameters = Parameters::SEGMENT_4_KIB;
     let aad = b"ambiguous provider";
+
+    // When each encryption entry point uses the ambiguous key
+    // Then each demands an explicit provider selection
     assert_eq!(key.provider(), Err(Error::ProviderSelectionRequired));
     assert!(matches!(
         encrypt(&key, aad, parameters, b"message"),
@@ -96,6 +109,8 @@ fn ambiguous_keys_fail_from_every_entry_layer() {
         Err(Error::ProviderSelectionRequired)
     ));
 
+    // When each decryption entry point uses the ambiguous key on a valid
+    // ciphertext, then each demands an explicit provider selection
     let ciphertext = encrypt(&test_key(), aad, parameters, b"message").unwrap();
     let header = Header::try_from(&ciphertext[..Header::LEN]).unwrap();
     assert_eq!(
@@ -111,6 +126,8 @@ fn ambiguous_keys_fail_from_every_entry_layer() {
         Err(Error::ProviderSelectionRequired)
     ));
 
+    // When the io and random-access layers use the ambiguous key
+    // Then each wraps the same selection error in its io::Error
     let encryption_error =
         crate::io::EncryptWriter::new(Vec::new(), &key, aad, parameters).unwrap_err();
     assert_eq!(encryption_error.kind(), std::io::ErrorKind::Other);
@@ -142,6 +159,8 @@ fn ambiguous_keys_fail_from_every_entry_layer() {
         Some(Error::ProviderSelectionRequired)
     ));
 
+    // Then the error message names every compiled provider and the
+    // constructors that resolve the ambiguity
     let message = Error::ProviderSelectionRequired.to_string();
     for provider in Provider::COMPILED {
         assert!(message.contains(provider.name()));
@@ -152,6 +171,8 @@ fn ambiguous_keys_fail_from_every_entry_layer() {
 
 #[test]
 fn every_kat_decrypts() {
+    // Given the vendored known-answer vectors; a published crate omits
+    // them, which is tolerated only outside a repository checkout
     let manifest_directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let kat_directory = manifest_directory.join("kats");
     if !kat_directory.exists() {
@@ -178,6 +199,8 @@ fn every_kat_decrypts() {
         })
         .collect();
     kat_names.sort();
+
+    // Then every supported vector is present
     assert!(
         !kat_names.is_empty(),
         "no KATs found in {}",
@@ -190,6 +213,8 @@ fn every_kat_decrypts() {
         kat_directory.display()
     );
 
+    // When each vector's ciphertext is decrypted with its parameter set
+    // Then the specified plaintext is recovered
     for name in kat_names {
         let parameters = if name.ends_with("GCM256_IV256_1M") {
             Parameters::SEGMENT_1_MIB

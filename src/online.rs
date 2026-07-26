@@ -626,17 +626,24 @@ mod tests {
 
     #[test]
     fn online_states_reserve_last_position_for_final_segment() {
+        // Given online states advanced to the last permitted position
         let key = test_key();
         let parameters = Parameters::SEGMENT_4_KIB;
         let mut encryption = Encryptor::new(&key, b"segment limit", parameters).unwrap();
         let header = *encryption.header();
         encryption.counter.next = AEAD_MAX_SEGMENTS - 1;
+
+        // When a non-final segment is encrypted there
+        // Then the position is refused; it is reserved for the final segment
         assert_eq!(
             encryption.encrypt_non_final_segment(&[]),
             Err(Error::SegmentLimit)
         );
+
+        // When the final segment is encrypted there instead
         let final_segment = encryption.encrypt_final_segment(b"last").unwrap();
 
+        // Then a decryptor at the same position accepts it and finishes
         let mut decryption = Decryptor::new(&key, b"segment limit", &header).unwrap();
         assert_eq!(decryption.parameters(), parameters);
         decryption.counter.next = AEAD_MAX_SEGMENTS - 1;
@@ -647,6 +654,7 @@ mod tests {
 
     #[test]
     fn complete_message_round_trips_boundaries() {
+        // Given plaintext lengths at and around every segment boundary
         let parameters = Parameters::SEGMENT_4_KIB;
         let segment_length = parameters.plaintext_segment_length();
         for length in [
@@ -661,7 +669,11 @@ mod tests {
             let plaintext: Vec<u8> = (0..length)
                 .map(|index| u8::try_from(index % 251).unwrap())
                 .collect();
+
+            // When the message is encrypted and decrypted whole
             let ciphertext = encrypt(&test_key(), b"aad", parameters, &plaintext).unwrap();
+
+            // Then the plaintext round-trips
             assert_eq!(
                 decrypt(&test_key(), b"aad", &ciphertext).unwrap(),
                 plaintext,
@@ -672,6 +684,8 @@ mod tests {
 
     #[test]
     fn complete_message_decrypts_full_non_final_and_empty_final_segments() {
+        // Given a message framed as one full non-final segment followed by
+        // an empty final segment, instead of the encoder's canonical framing
         let parameters = Parameters::SEGMENT_4_KIB;
         let plaintext = vec![0x5a; parameters.plaintext_segment_length()];
         let mut encryption = Encryptor::new(&test_key(), b"alternate framing", parameters).unwrap();
@@ -685,6 +699,8 @@ mod tests {
         ciphertext.extend_from_slice(&non_final);
         ciphertext.extend_from_slice(&final_segment);
 
+        // When the complete message is decrypted
+        // Then the alternate framing is accepted and the plaintext recovered
         let layout = parameters
             .ciphertext_layout(u64::try_from(ciphertext.len()).unwrap())
             .unwrap();
@@ -696,32 +712,61 @@ mod tests {
     }
 
     #[test]
-    fn online_state_enforces_finalization() {
+    fn finish_before_final_segment_reports_truncation() {
+        // Given a decryptor that has processed no final segment
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let encryption = Encryptor::new(&test_key(), b"aad", parameters).unwrap();
+        let header = *encryption.header();
+        let decryption = Decryptor::new(&test_key(), b"aad", &header).unwrap();
+
+        // When it is finished
+        // Then the missing final segment is reported as truncation
+        assert_eq!(decryption.finish(), Err(Error::Truncated));
+    }
+
+    #[test]
+    fn decryptor_closes_after_final_segment() {
+        // Given a message consisting of one final segment
         let parameters = Parameters::SEGMENT_4_KIB;
         let encryption = Encryptor::new(&test_key(), b"aad", parameters).unwrap();
         assert_eq!(encryption.next_position(), 0);
         let header = *encryption.header();
         let final_segment = encryption.encrypt_final_segment(b"done").unwrap();
 
-        let decryption = Decryptor::new(&test_key(), b"aad", &header).unwrap();
-        assert_eq!(decryption.finish(), Err(Error::Truncated));
-
+        // When the final segment is decrypted
         let mut decryption = Decryptor::new(&test_key(), b"aad", &header).unwrap();
         assert_eq!(decryption.decrypt_segment(&final_segment).unwrap(), b"done");
+
+        // Then the decryptor is finished, refuses further segments, and
+        // finishes cleanly
         assert!(decryption.is_finished());
         assert_eq!(
             decryption.decrypt_segment(&final_segment),
             Err(Error::Closed)
         );
         assert!(decryption.finish().is_ok());
+    }
 
+    #[test]
+    fn decrypt_segment_into_requires_sufficient_output() {
+        // Given a four-byte final segment and an undersized output buffer
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let encryption = Encryptor::new(&test_key(), b"aad", parameters).unwrap();
+        let header = *encryption.header();
+        let final_segment = encryption.encrypt_final_segment(b"done").unwrap();
         let mut decryption = Decryptor::new(&test_key(), b"aad", &header).unwrap();
         assert_eq!(decryption.next_position(), 0);
+
+        // When the segment is decrypted into three bytes of output
+        // Then the buffer is rejected without consuming the segment
         let mut too_small = [0u8; 3];
         assert!(matches!(
             decryption.decrypt_segment_into(&final_segment, &mut too_small),
             Err(Error::OutputTooSmall { .. })
         ));
+
+        // When it is decrypted into an exactly sized buffer
+        // Then the plaintext is written and the decryptor finishes
         let mut output = [0u8; 4];
         assert_eq!(
             decryption
@@ -731,10 +776,21 @@ mod tests {
         );
         assert_eq!(&output, b"done");
         assert!(decryption.finish().is_ok());
+    }
 
+    #[test]
+    fn segments_shorter_than_minimum_overhead_rejected() {
+        // Given a segment whose prefix declares less than the framing
+        // overhead
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let encryption = Encryptor::new(&test_key(), b"aad", parameters).unwrap();
+        let header = *encryption.header();
         let mut invalid_prefix = [0u8; SEGMENT_OVERHEAD];
         invalid_prefix[..SEGMENT_PREFIX_LENGTH]
             .copy_from_slice(&u32::try_from(SEGMENT_OVERHEAD - 1).unwrap().to_be_bytes());
+
+        // When the segment is decrypted
+        // Then the declared length is rejected as out of range
         let mut decryption = Decryptor::new(&test_key(), b"aad", &header).unwrap();
         assert!(matches!(
             decryption.decrypt_segment(&invalid_prefix),
@@ -743,7 +799,12 @@ mod tests {
                 required: LengthRequirement::Between {..},
             }) if actual == SEGMENT_OVERHEAD - 1
         ));
+    }
 
+    #[test]
+    fn final_segment_round_trips_in_place() {
+        // Given a final payload prepared in a reusable segment buffer
+        let parameters = Parameters::SEGMENT_4_KIB;
         let encryption = Encryptor::new(&test_key(), b"aad", parameters).unwrap();
         let header = *encryption.header();
         let mut in_place = SegmentBuffer::new(parameters);
@@ -751,10 +812,14 @@ mod tests {
             .prepare_plaintext(4)
             .unwrap()
             .copy_from_slice(b"done");
+
+        // When the buffer is encrypted and decrypted in place
         encryption
             .encrypt_final_segment_in_place(&mut in_place)
             .unwrap();
         let mut decryption = Decryptor::new(&test_key(), b"aad", &header).unwrap();
+
+        // Then the plaintext is recovered and the decryptor finishes
         assert_eq!(
             decryption.decrypt_segment_in_place(&mut in_place).unwrap(),
             b"done"
@@ -764,36 +829,56 @@ mod tests {
 
     #[test]
     fn failed_final_encryption_returns_reusable_state() {
+        // Given final-segment encryption that fails on an undersized buffer
         let parameters = Parameters::SEGMENT_4_KIB;
         let encryption = Encryptor::new(&test_key(), b"recover final", parameters).unwrap();
         let header = *encryption.header();
         let mut too_small = [0u8; SEGMENT_OVERHEAD];
 
+        // When the failure is returned
         let failure = encryption
             .encrypt_final_segment_into(b"retry", &mut too_small)
             .unwrap_err();
+
+        // Then it reports the cause without leaking encryptor internals
         assert!(matches!(failure.error(), Error::OutputTooSmall { .. }));
         assert!(!format!("{failure:?}").contains("Encryptor"));
 
+        // When the encryptor is recovered from the failure
         let encryption = failure.into_encryptor();
+
+        // Then its state is unchanged and the retry produces a message the
+        // original header still authenticates
         assert_eq!(encryption.header(), &header);
         assert_eq!(encryption.next_position(), 0);
         let encrypted = encryption.encrypt_final_segment(b"retry").unwrap();
-
         let mut decryption = Decryptor::new(&test_key(), b"recover final", &header).unwrap();
         assert_eq!(decryption.decrypt_segment(&encrypted).unwrap(), b"retry");
         decryption.finish().unwrap();
     }
 
     #[test]
-    fn authentication_and_framing_fail_closed() {
+    fn wrong_aad_fails_header_authentication() {
+        // Given a ciphertext encrypted under one AAD
         let parameters = Parameters::SEGMENT_4_KIB;
         let ciphertext = encrypt(&test_key(), b"correct aad", parameters, b"plaintext").unwrap();
 
+        // When it is decrypted under another
+        // Then the header tag is rejected before any payload is produced
         assert_eq!(
             decrypt(&test_key(), b"wrong aad", &ciphertext),
             Err(Error::InvalidHeaderTag)
         );
+    }
+
+    #[test]
+    fn header_slices_require_exact_length() {
+        // Given slices one byte shorter and one byte longer than a header
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let ciphertext = encrypt(&test_key(), b"correct aad", parameters, b"plaintext").unwrap();
+
+        // When each is parsed as a header
+        // Then both lengths are rejected
         assert!(matches!(
             Header::try_from(&ciphertext[..HEADER_LENGTH - 1]),
             Err(Error::InvalidHeaderLength { .. })
@@ -802,27 +887,56 @@ mod tests {
             Header::try_from(&ciphertext[..=HEADER_LENGTH]),
             Err(Error::InvalidHeaderLength { .. })
         ));
+    }
 
+    #[test]
+    fn flipped_header_bit_fails_header_authentication() {
+        // Given a ciphertext whose header tag has one flipped bit
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let ciphertext = encrypt(&test_key(), b"correct aad", parameters, b"plaintext").unwrap();
         let mut bad_header = ciphertext.clone();
         bad_header[HEADER_LENGTH - 1] ^= 1;
+
+        // When it is decrypted
+        // Then the header tag is rejected
         assert_eq!(
             decrypt(&test_key(), b"correct aad", &bad_header),
             Err(Error::InvalidHeaderTag)
         );
+    }
 
+    #[test]
+    fn flipped_ciphertext_bit_fails_segment_authentication() {
+        // Given a ciphertext whose final byte has one flipped bit
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let ciphertext = encrypt(&test_key(), b"correct aad", parameters, b"plaintext").unwrap();
         let mut bad_segment = ciphertext.clone();
         *bad_segment.last_mut().unwrap() ^= 1;
+
+        // When it is decrypted
+        // Then segment authentication fails
         assert_eq!(
             decrypt(&test_key(), b"correct aad", &bad_segment),
             Err(Error::AuthenticationFailed)
         );
+    }
 
+    #[test]
+    fn truncated_ciphertexts_classified_by_missing_bytes() {
+        // Given a valid single-segment ciphertext
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let ciphertext = encrypt(&test_key(), b"correct aad", parameters, b"plaintext").unwrap();
+
+        // When only the header survives
+        // Then the missing body is reported as truncation
         let header_only = &ciphertext[..HEADER_LENGTH];
         assert_eq!(
             decrypt(&test_key(), b"correct aad", header_only),
             Err(Error::Truncated)
         );
 
+        // When the final byte is missing
+        // Then the segment is rejected with the exact shortfall
         let truncated = &ciphertext[..ciphertext.len() - 1];
         assert_eq!(
             decrypt(&test_key(), b"correct aad", truncated),
@@ -832,6 +946,8 @@ mod tests {
             })
         );
 
+        // When the body is only a prefix declaring an undersized segment
+        // Then the declared length is rejected
         let mut undersized_final = header_only.to_vec();
         undersized_final.extend_from_slice(&4_u32.to_be_bytes());
         assert!(matches!(
@@ -842,17 +958,29 @@ mod tests {
 
     #[test]
     fn every_truncation_of_valid_ciphertext_rejected() {
+        // Given a valid multi-segment ciphertext
         let parameters = Parameters::SEGMENT_4_KIB;
         let plaintext = vec![0x3c; 3 * parameters.plaintext_segment_length() + 7];
         let ciphertext = encrypt(&test_key(), b"aad", parameters, &plaintext).unwrap();
 
+        // When it is truncated to every possible length
         for end in 0..ciphertext.len() {
+            // Then no truncation decrypts successfully
             assert!(
                 decrypt(&test_key(), b"aad", &ciphertext[..end]).is_err(),
                 "accepted ciphertext truncated to {end} bytes"
             );
         }
+    }
 
+    #[test]
+    fn decrypt_with_parameters_rejects_mismatched_profile() {
+        // Given a ciphertext encrypted with 4 KiB segments
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let ciphertext = encrypt(&test_key(), b"aad", parameters, b"plaintext").unwrap();
+
+        // When decryption demands the 1 MiB profile
+        // Then the header's parameters are rejected
         assert_eq!(
             decrypt_with_parameters(&test_key(), b"aad", Parameters::SEGMENT_1_MIB, &ciphertext,),
             Err(Error::InvalidHeaderParameters)
