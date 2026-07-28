@@ -14,7 +14,7 @@ use crate::{
 const HEADER_TAG_PURPOSE: &[u8] = b"HEADER_TAG:";
 const MESSAGE_KEY_PURPOSE: &[u8] = b"MESSAGE_KEY:";
 const SEGMENT_KEY_PURPOSE: &[u8] = b"DEK:";
-const NONCE_BATCH_SIZE: usize = 64;
+const NONCE_BATCH_SIZE: usize = 256;
 const NONCE_BATCH_LENGTH: usize = AEAD_IV_LENGTH * NONCE_BATCH_SIZE;
 const SEGMENT_AAD_LENGTH: usize = 9;
 
@@ -300,18 +300,23 @@ fn encrypt_segment_into_inner(
             required,
         });
     }
-    let plaintext_start = SEGMENT_PAYLOAD_OFFSET;
-    output[plaintext_start..plaintext_start + plaintext.len()].copy_from_slice(plaintext);
-    encrypt_prepared_segment(
-        context,
-        keys,
-        nonces,
-        output,
-        plaintext.len(),
-        position,
-        kind,
-        required,
-    )
+    let nonce = nonces.next()?;
+    let key = keys.key_for_position(context, position)?;
+    let prefix = match kind {
+        SegmentKind::NonFinal => u32::MAX,
+        SegmentKind::Final => u32::try_from(required).map_err(|_| Error::LengthOverflow)?,
+    };
+    output[..SEGMENT_PREFIX_LENGTH].copy_from_slice(&prefix.to_be_bytes());
+    output[SEGMENT_PREFIX_LENGTH..SEGMENT_PAYLOAD_OFFSET].copy_from_slice(&nonce);
+
+    let segment_aad = segment_aad(position, kind);
+    key.seal_into(
+        &nonce,
+        &segment_aad,
+        plaintext,
+        &mut output[SEGMENT_PAYLOAD_OFFSET..required],
+    )?;
+    Ok(required)
 }
 
 #[inline]
@@ -1509,7 +1514,8 @@ mod tests {
             start_encryption(&test_key(), b"nonce batches", parameters).unwrap();
         let mut nonces = HashSet::new();
 
-        for position in 0..130 {
+        let positions = u64::try_from(2 * NONCE_BATCH_SIZE + 2).unwrap();
+        for position in 0..positions {
             // When each segment is encrypted
             encryption
                 .encrypt_segment_into_at(

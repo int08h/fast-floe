@@ -161,6 +161,28 @@ mod aead_aws_lc_rs {
             Ok(())
         }
 
+        /// Encrypts `plaintext` directly into `output` (`ciphertext || tag`)
+        /// in one pass, avoiding the separate plaintext copy the in-place
+        /// seal would require.
+        #[inline]
+        pub(crate) fn seal_into(
+            &self,
+            nonce: &[u8; 12],
+            aad: &[u8],
+            plaintext: &[u8],
+            output: &mut [u8],
+        ) -> Result<()> {
+            self.0
+                .seal_in_place_scatter(
+                    Nonce::assume_unique_for_key(*nonce),
+                    Aad::from(aad),
+                    &mut [],
+                    plaintext,
+                    output,
+                )
+                .map_err(|_| Error::CryptoFailure)
+        }
+
         #[inline]
         pub(crate) fn open(
             &self,
@@ -447,6 +469,40 @@ impl AeadKey {
             Self::Ring(key) => key.seal(nonce, aad, in_out, tag),
             #[cfg(feature = "rustcrypto")]
             Self::RustCrypto(key) => key.seal(nonce, aad, in_out, tag),
+        }
+    }
+
+    /// Encrypts `plaintext` into `output`, which must hold exactly
+    /// `plaintext.len() + AEAD_TAG_LENGTH` bytes of `ciphertext || tag`.
+    ///
+    /// Providers without a one-pass scatter API copy the plaintext into
+    /// `output` and seal in place.
+    pub(crate) fn seal_into(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        plaintext: &[u8],
+        output: &mut [u8],
+    ) -> Result<()> {
+        let expected = plaintext
+            .len()
+            .checked_add(crate::AEAD_TAG_LENGTH)
+            .ok_or(crate::Error::LengthOverflow)?;
+        if output.len() != expected {
+            return Err(crate::Error::CryptoFailure);
+        }
+        #[allow(unreachable_patterns, clippy::match_wildcard_for_single_variants)]
+        match self {
+            #[cfg(feature = "aws-lc-rs")]
+            Self::AwsLcRs(key) => key.seal_into(nonce, aad, plaintext, output),
+            _ => {
+                let (ciphertext, tag_out) = output.split_at_mut(plaintext.len());
+                ciphertext.copy_from_slice(plaintext);
+                let mut tag = [0u8; crate::AEAD_TAG_LENGTH];
+                self.seal(nonce, aad, ciphertext, &mut tag)?;
+                tag_out.copy_from_slice(&tag);
+                Ok(())
+            }
         }
     }
 

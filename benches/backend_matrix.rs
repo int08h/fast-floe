@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use criterion::{
     BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
 };
-use fast_floe::low_level::SegmentBuffer;
+use fast_floe::low_level::{SEGMENT_PAYLOAD_OFFSET, start_decryption_inferred, start_encryption};
 use fast_floe::online::{Decryptor, Encryptor, FinalEncryptError};
 use fast_floe::random_access::MessageLayout;
 use fast_floe::{Header, Key, Parameters, Provider, SegmentKind, encrypt};
@@ -271,18 +271,27 @@ fn benchmark_encryption(
     let mut in_place_group = criterion.benchmark_group("encrypt_complete_in_place");
     in_place_group.sampling_mode(SamplingMode::Flat);
     in_place_group.throughput(Throughput::Bytes(plaintext.len() as u64));
-    // Buffers are allocated once and refilled between iterations. Criterion's
-    // warm-up estimate counts untimed setup wall-clock, so per-iteration
-    // allocation of LLC-multiple working sets would trip its sample-count
-    // warning even though setup is excluded from the measurement.
-    let mut buffers = segment_buffers(parameters, layout);
+    // One contiguous arena holds every segment slot at its final message
+    // offset, so FLOE and the bare-AEAD baseline traverse identically shaped
+    // memory. A fleet of per-segment heap buffers instead measures allocator
+    // placement: in earlier runs the same FLOE code swung between 11 and 20
+    // GiB/s depending on which allocations the arena recycled. The arena is
+    // refilled, not reallocated, between iterations because Criterion's
+    // warm-up estimate counts untimed setup wall-clock.
+    let mut arena = vec![
+        0;
+        usize::try_from(layout.ciphertext_length())
+            .expect("benchmark length fits in usize")
+    ];
     in_place_group.bench_function(benchmark_id(), |bencher| {
         bencher.iter_custom(|iterations| {
             let mut elapsed = Duration::ZERO;
             for _ in 0..iterations {
-                refill_plaintext(&mut buffers, plaintext, layout);
+                refill_arena_plaintext(&mut arena, plaintext, layout);
                 let start = Instant::now();
-                std::hint::black_box(encrypt_complete_in_place(key, parameters, &mut buffers));
+                std::hint::black_box(encrypt_complete_in_place(
+                    key, parameters, &mut arena, layout,
+                ));
                 elapsed += start.elapsed();
             }
             elapsed
@@ -316,7 +325,7 @@ fn benchmark_decryption(
     let BenchmarkCase {
         provider,
         name: case_name,
-        parameters,
+        parameters: _,
         plaintext,
         layout,
     } = case;
@@ -349,15 +358,15 @@ fn benchmark_decryption(
     let mut in_place_group = criterion.benchmark_group("decrypt_complete_in_place");
     in_place_group.sampling_mode(SamplingMode::Flat);
     in_place_group.throughput(Throughput::Bytes(plaintext_length as u64));
-    // See encrypt_complete_in_place for why buffers are refilled, not rebuilt.
-    let mut buffers = segment_buffers(parameters, layout);
+    // See encrypt_complete_in_place for why one refilled arena is used.
+    let mut arena = ciphertext.to_vec();
     in_place_group.bench_function(benchmark_id(), |bencher| {
         bencher.iter_custom(|iterations| {
             let mut elapsed = Duration::ZERO;
             for _ in 0..iterations {
-                refill_ciphertext(&mut buffers, ciphertext, layout);
+                arena.copy_from_slice(ciphertext);
                 let start = Instant::now();
-                std::hint::black_box(decrypt_complete_in_place(key, ciphertext, &mut buffers));
+                std::hint::black_box(decrypt_complete_in_place(key, &mut arena, layout));
                 elapsed += start.elapsed();
             }
             elapsed
@@ -437,27 +446,19 @@ fn encrypt_complete_into(
 fn encrypt_complete_in_place(
     key: &Key,
     parameters: Parameters,
-    buffers: &mut [SegmentBuffer],
+    arena: &mut [u8],
+    layout: MessageLayout,
 ) -> usize {
-    let mut encryptor =
-        Some(Encryptor::new(key, AAD, parameters).expect("encryption setup failed"));
+    let (mut state, header) =
+        start_encryption(key, AAD, parameters).expect("encryption setup failed");
+    arena[..Header::LEN].copy_from_slice(header.as_ref());
     let mut written = Header::LEN;
-    let last = buffers.len() - 1;
-    for (position, buffer) in buffers.iter_mut().enumerate() {
-        written += if position == last {
-            encryptor
-                .take()
-                .expect("final segment appears once")
-                .encrypt_final_segment_in_place(buffer)
-                .map_err(FinalEncryptError::into_error)
-        } else {
-            encryptor
-                .as_mut()
-                .expect("encryptor is present")
-                .encrypt_non_final_segment_in_place(buffer)
-        }
-        .expect("in-place segment encryption failed")
-        .len();
+    for segment in layout {
+        let start = usize::try_from(segment.ciphertext_offset()).expect("offset fits in usize");
+        let end = start + segment.ciphertext_length();
+        written += state
+            .encrypt_segment_in_place_raw(&mut arena[start..end], segment)
+            .expect("in-place segment encryption failed");
     }
     written
 }
@@ -490,46 +491,31 @@ fn decrypt_complete_into(
     written_total
 }
 
-fn decrypt_complete_in_place(key: &Key, ciphertext: &[u8], buffers: &mut [SegmentBuffer]) -> usize {
-    let header = Header::try_from(&ciphertext[..Header::LEN]).expect("complete header");
-    let mut decryptor = Decryptor::new(key, AAD, &header).expect("decryption setup failed");
+fn decrypt_complete_in_place(key: &Key, arena: &mut [u8], layout: MessageLayout) -> usize {
+    let header = Header::try_from(&arena[..Header::LEN]).expect("complete header");
+    let mut state = start_decryption_inferred(key, AAD, &header).expect("decryption setup failed");
     let mut written = 0;
-    for buffer in buffers {
-        written += decryptor
-            .decrypt_segment_in_place(buffer)
+    for segment in layout {
+        let start = usize::try_from(segment.ciphertext_offset()).expect("offset fits in usize");
+        let end = start + segment.ciphertext_length();
+        written += state
+            .decrypt_segment_in_place_raw(&mut arena[start..end], segment)
             .expect("in-place segment decryption failed")
             .len();
     }
-    decryptor.finish().expect("final segment was present");
     written
 }
 
-fn segment_buffers(parameters: Parameters, layout: MessageLayout) -> Vec<SegmentBuffer> {
-    layout
-        .into_iter()
-        .map(|_| SegmentBuffer::new(parameters))
-        .collect()
-}
-
-fn refill_plaintext(buffers: &mut [SegmentBuffer], plaintext: &[u8], layout: MessageLayout) {
-    for (buffer, segment) in buffers.iter_mut().zip(layout) {
-        let start = usize::try_from(segment.plaintext_offset()).expect("offset fits in usize");
-        let end = start + segment.plaintext_length();
-        buffer
-            .prepare_plaintext(segment.plaintext_length())
-            .expect("valid plaintext length")
-            .copy_from_slice(&plaintext[start..end]);
-    }
-}
-
-fn refill_ciphertext(buffers: &mut [SegmentBuffer], ciphertext: &[u8], layout: MessageLayout) {
-    for (buffer, segment) in buffers.iter_mut().zip(layout) {
-        let start = usize::try_from(segment.ciphertext_offset()).expect("offset fits in usize");
-        let end = start + segment.ciphertext_length();
-        buffer
-            .prepare_ciphertext(segment.ciphertext_length())
-            .expect("valid encrypted length")
-            .copy_from_slice(&ciphertext[start..end]);
+fn refill_arena_plaintext(arena: &mut [u8], plaintext: &[u8], layout: MessageLayout) {
+    for segment in layout {
+        let plaintext_start =
+            usize::try_from(segment.plaintext_offset()).expect("offset fits in usize");
+        let payload_start = usize::try_from(segment.ciphertext_offset())
+            .expect("offset fits in usize")
+            + SEGMENT_PAYLOAD_OFFSET;
+        arena[payload_start..payload_start + segment.plaintext_length()].copy_from_slice(
+            &plaintext[plaintext_start..plaintext_start + segment.plaintext_length()],
+        );
     }
 }
 

@@ -40,6 +40,9 @@ rayon = "1.12"
 name = "backend_matrix"
 harness = false
 
+[profile.bench]
+lto = "thin"
+
 [lints.rust]
 unsafe_code = "forbid"
 
