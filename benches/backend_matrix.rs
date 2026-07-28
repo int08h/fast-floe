@@ -9,6 +9,10 @@ use fast_floe::random_access::MessageLayout;
 use fast_floe::{Header, Key, Parameters, Provider, SegmentKind, encrypt};
 
 const AAD: &[u8] = b"benchmark";
+const KEY_BYTES: [u8; 32] = [0x42; 32];
+// Reuse is intentional for deterministic, discarded benchmark output only.
+const BASELINE_NONCE: [u8; 12] = [0x24; 12];
+const AEAD_TAG_LENGTH: usize = 16;
 const KIB: usize = 1024;
 const MIB: usize = 1024 * 1024;
 
@@ -21,6 +25,165 @@ const MIN_SEGMENT_COUNT: usize = 96;
 /// Fallback message sizes if last-level cache cannot be detected.
 const DEFAULT_SMALL_SEGMENT_TARGET: usize = 4 * MIB;
 const DEFAULT_LARGE_SEGMENT_TARGET: usize = 64 * MIB;
+
+#[allow(clippy::large_enum_variant)]
+enum BaselineAead {
+    #[cfg(feature = "aws-lc-rs")]
+    AwsLcRs(aws_lc_rs::aead::LessSafeKey),
+    #[cfg(feature = "boring")]
+    Boring(boring::aead::AeadCtx),
+    #[cfg(feature = "ring")]
+    Ring(ring::aead::LessSafeKey),
+    #[cfg(feature = "rustcrypto")]
+    RustCrypto(aes_gcm::Aes256Gcm),
+}
+
+impl BaselineAead {
+    fn new(provider: Provider) -> Self {
+        #[allow(unreachable_patterns)]
+        match provider {
+            #[cfg(feature = "aws-lc-rs")]
+            Provider::AWS_LC_RS => {
+                let key =
+                    aws_lc_rs::aead::UnboundKey::new(&aws_lc_rs::aead::AES_256_GCM, &KEY_BYTES)
+                        .expect("AWS-LC baseline key setup failed");
+                Self::AwsLcRs(aws_lc_rs::aead::LessSafeKey::new(key))
+            }
+            #[cfg(feature = "boring")]
+            Provider::BORING => {
+                let algorithm = boring::aead::Algorithm::aes_256_gcm();
+                let key = boring::aead::AeadCtx::new(&algorithm, &KEY_BYTES, AEAD_TAG_LENGTH)
+                    .expect("BoringSSL baseline key setup failed");
+                Self::Boring(key)
+            }
+            #[cfg(feature = "ring")]
+            Provider::RING => {
+                let key = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &KEY_BYTES)
+                    .expect("Ring baseline key setup failed");
+                Self::Ring(ring::aead::LessSafeKey::new(key))
+            }
+            #[cfg(feature = "rustcrypto")]
+            Provider::RUSTCRYPTO => {
+                use aes_gcm::KeyInit;
+
+                Self::RustCrypto(
+                    aes_gcm::Aes256Gcm::new_from_slice(&KEY_BYTES)
+                        .expect("RustCrypto baseline key setup failed"),
+                )
+            }
+            _ => unreachable!("provider is compiled into this benchmark"),
+        }
+    }
+
+    fn seal_in_place(&self, in_out: &mut [u8]) -> [u8; AEAD_TAG_LENGTH] {
+        let mut tag = [0; AEAD_TAG_LENGTH];
+        match self {
+            #[cfg(feature = "aws-lc-rs")]
+            Self::AwsLcRs(key) => {
+                use aws_lc_rs::aead::{Aad, Nonce};
+
+                let generated = key
+                    .seal_in_place_separate_tag(
+                        Nonce::assume_unique_for_key(BASELINE_NONCE),
+                        Aad::from(AAD),
+                        in_out,
+                    )
+                    .expect("AWS-LC baseline encryption failed");
+                tag.copy_from_slice(generated.as_ref());
+            }
+            #[cfg(feature = "boring")]
+            Self::Boring(key) => {
+                let written = key
+                    .seal_in_place(&BASELINE_NONCE, in_out, &mut tag, AAD)
+                    .expect("BoringSSL baseline encryption failed");
+                assert_eq!(written.len(), AEAD_TAG_LENGTH);
+            }
+            #[cfg(feature = "ring")]
+            Self::Ring(key) => {
+                use ring::aead::{Aad, Nonce};
+
+                let generated = key
+                    .seal_in_place_separate_tag(
+                        Nonce::assume_unique_for_key(BASELINE_NONCE),
+                        Aad::from(AAD),
+                        in_out,
+                    )
+                    .expect("Ring baseline encryption failed");
+                tag.copy_from_slice(generated.as_ref());
+            }
+            #[cfg(feature = "rustcrypto")]
+            Self::RustCrypto(key) => {
+                use aes_gcm::aead::{AeadInOut, Nonce};
+
+                let generated = key
+                    .encrypt_inout_detached(
+                        &Nonce::<aes_gcm::Aes256Gcm>::from(BASELINE_NONCE),
+                        AAD,
+                        in_out.into(),
+                    )
+                    .expect("RustCrypto baseline encryption failed");
+                tag.copy_from_slice(&generated);
+            }
+        }
+        tag
+    }
+
+    fn open_in_place(&self, tag: &[u8; AEAD_TAG_LENGTH], in_out: &mut [u8]) {
+        match self {
+            #[cfg(feature = "aws-lc-rs")]
+            Self::AwsLcRs(key) => {
+                use aws_lc_rs::aead::{Aad, Nonce};
+
+                key.open_in_place_separate_tag(
+                    Nonce::assume_unique_for_key(BASELINE_NONCE),
+                    Aad::from(AAD),
+                    tag,
+                    in_out,
+                )
+                .expect("AWS-LC baseline decryption failed");
+            }
+            #[cfg(feature = "boring")]
+            Self::Boring(key) => {
+                key.open_in_place(&BASELINE_NONCE, in_out, tag, AAD)
+                    .expect("BoringSSL baseline decryption failed");
+            }
+            #[cfg(feature = "ring")]
+            Self::Ring(key) => {
+                use ring::aead::{Aad, Nonce, Tag};
+
+                key.open_in_place_separate_tag(
+                    Nonce::assume_unique_for_key(BASELINE_NONCE),
+                    Aad::from(AAD),
+                    Tag::from(*tag),
+                    in_out,
+                    0..,
+                )
+                .expect("Ring baseline decryption failed");
+            }
+            #[cfg(feature = "rustcrypto")]
+            Self::RustCrypto(key) => {
+                use aes_gcm::aead::{AeadInOut, Nonce, Tag};
+
+                key.decrypt_inout_detached(
+                    &Nonce::<aes_gcm::Aes256Gcm>::from(BASELINE_NONCE),
+                    AAD,
+                    in_out.into(),
+                    &Tag::<aes_gcm::Aes256Gcm>::from(*tag),
+                )
+                .expect("RustCrypto baseline decryption failed");
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BenchmarkCase<'a> {
+    provider: Provider,
+    name: &'a str,
+    parameters: Parameters,
+    plaintext: &'a [u8],
+    layout: MessageLayout,
+}
 
 fn benchmark_backend_matrix(criterion: &mut Criterion) {
     let (small_target, large_target) = target_lengths();
@@ -37,7 +200,8 @@ fn benchmark_backend_matrix(criterion: &mut Criterion) {
         ),
     ];
     for &provider in Provider::COMPILED {
-        let key = Key::from_bytes_with_provider([0x42; Key::LEN], provider);
+        let key = Key::from_bytes_with_provider(KEY_BYTES, provider);
+        let baseline_key = BaselineAead::new(provider);
         for (case_name, parameters, target_length) in &cases {
             let (case_name, parameters, target_length) =
                 (case_name.as_str(), *parameters, *target_length);
@@ -54,19 +218,16 @@ fn benchmark_backend_matrix(criterion: &mut Criterion) {
             );
             let ciphertext = encrypt(&key, AAD, parameters, &plaintext)
                 .expect("benchmark setup encryption failed");
-
-            benchmark_encryption(
-                criterion, &key, provider, case_name, parameters, &plaintext, layout,
-            );
-            benchmark_decryption(
-                criterion,
-                &key,
+            let case = BenchmarkCase {
                 provider,
-                case_name,
+                name: case_name,
                 parameters,
-                &ciphertext,
+                plaintext: &plaintext,
                 layout,
-            );
+            };
+
+            benchmark_encryption(criterion, &key, &baseline_key, case);
+            benchmark_decryption(criterion, &key, &baseline_key, case, &ciphertext);
         }
     }
 }
@@ -74,12 +235,16 @@ fn benchmark_backend_matrix(criterion: &mut Criterion) {
 fn benchmark_encryption(
     criterion: &mut Criterion,
     key: &Key,
-    provider: Provider,
-    case_name: &str,
-    parameters: Parameters,
-    plaintext: &[u8],
-    layout: MessageLayout,
+    baseline_key: &BaselineAead,
+    case: BenchmarkCase<'_>,
 ) {
+    let BenchmarkCase {
+        provider,
+        name: case_name,
+        parameters,
+        plaintext,
+        layout,
+    } = case;
     let benchmark_id = || BenchmarkId::new(provider.name(), case_name);
     let mut encrypted_output = vec![
         0;
@@ -123,22 +288,48 @@ fn benchmark_encryption(
             elapsed
         });
     });
+    let mut baseline_buffer = plaintext.to_vec();
+    in_place_group.bench_function(baseline_benchmark_id(provider, case_name), |bencher| {
+        bencher.iter_custom(|iterations| {
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..iterations {
+                baseline_buffer.copy_from_slice(plaintext);
+                let start = Instant::now();
+                std::hint::black_box(
+                    baseline_key.seal_in_place(std::hint::black_box(&mut baseline_buffer)),
+                );
+                elapsed += start.elapsed();
+            }
+            elapsed
+        });
+    });
     in_place_group.finish();
 }
 
 fn benchmark_decryption(
     criterion: &mut Criterion,
     key: &Key,
-    provider: Provider,
-    case_name: &str,
-    parameters: Parameters,
+    baseline_key: &BaselineAead,
+    case: BenchmarkCase<'_>,
     ciphertext: &[u8],
-    layout: MessageLayout,
 ) {
+    let BenchmarkCase {
+        provider,
+        name: case_name,
+        parameters,
+        plaintext,
+        layout,
+    } = case;
     let benchmark_id = || BenchmarkId::new(provider.name(), case_name);
     let plaintext_length =
         usize::try_from(layout.plaintext_length()).expect("benchmark length fits in usize");
     let mut plaintext_output = vec![0; plaintext_length];
+    let mut baseline_ciphertext = plaintext.to_vec();
+    let baseline_tag = baseline_key.seal_in_place(&mut baseline_ciphertext);
+    let mut baseline_round_trip = baseline_ciphertext.clone();
+    baseline_key.open_in_place(&baseline_tag, &mut baseline_round_trip);
+    assert_eq!(baseline_round_trip, plaintext);
+    drop(baseline_round_trip);
 
     let mut into_group = criterion.benchmark_group("decrypt_complete_into");
     into_group.sampling_mode(SamplingMode::Flat);
@@ -172,7 +363,27 @@ fn benchmark_decryption(
             elapsed
         });
     });
+    let mut baseline_buffer = baseline_ciphertext.clone();
+    in_place_group.bench_function(baseline_benchmark_id(provider, case_name), |bencher| {
+        bencher.iter_custom(|iterations| {
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..iterations {
+                baseline_buffer.copy_from_slice(&baseline_ciphertext);
+                let start = Instant::now();
+                baseline_key.open_in_place(
+                    std::hint::black_box(&baseline_tag),
+                    std::hint::black_box(&mut baseline_buffer),
+                );
+                elapsed += start.elapsed();
+            }
+            elapsed
+        });
+    });
     in_place_group.finish();
+}
+
+fn baseline_benchmark_id(provider: Provider, case_name: &str) -> BenchmarkId {
+    BenchmarkId::new(format!("{}-aes-256-gcm", provider.name()), case_name)
 }
 
 fn encrypt_complete_into(
