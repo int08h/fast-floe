@@ -363,8 +363,9 @@ Median throughput in GiB/s with each provider compiled solo with `-C target-cpu=
 benchmark trial sizes its buffer to be at least 4x the detected last-level-cache size to ensure
 we're reaching actual memory, not spinning in cache.
 
-The "into" columns write to a separate output buffer (using scatter/gather if supported by the provider)
-while "in place" overwrite their input buffer.
+The "into" columns encrypt or decrypt into a separate output buffer in one pass
+(using scatter/gather when the provider supports it) while "in place" overwrite
+their input, processing segments within one contiguous arena.
 
 #### AMD Zen 5 9950X (VAES, AVX-512), Rust 1.97.1
 
@@ -372,16 +373,40 @@ In GiB/sec, higher is better
 
 | Provider     | Segments | Encrypt into | Encrypt in place | Decrypt into | Decrypt in place |
 |--------------|----------|-------------:|-----------------:|-------------:|-----------------:|
-| `aws-lc-rs`  | 1 MiB    |         9.29 |            13.12 |        14.10 |            16.93 |
-| `boring`     | 1 MiB    |         8.90 |            17.47 |         9.35 |            17.70 |
-| `ring`       | 1 MiB    |         6.59 |            11.90 |         6.90 |            12.51 |
-| `rustcrypto` | 1 MiB    |         3.70 |             4.64 |         4.65 |             4.77 |
-| `aws-lc-rs`  | 4 KiB    |         7.16 |            11.23 |         9.34 |            12.70 |
-| `boring`     | 4 KiB    |         7.50 |            14.77 |         7.91 |            16.73 |
-| `ring`       | 4 KiB    |         6.33 |             9.81 |         7.05 |            10.58 |
-| `rustcrypto` | 4 KiB    |         3.53 |             4.45 |         4.17 |             4.22 |
+| `aws-lc-rs`  | 1 MiB    |        13.06 |            19.82 |        14.13 |            19.93 |
+| `boring`     | 1 MiB    |        12.31 |            17.82 |         8.41 |            16.59 |
+| `ring`       | 1 MiB    |         6.32 |            11.43 |         6.14 |            12.38 |
+| `rustcrypto` | 1 MiB    |         4.65 |             4.74 |         4.88 |             4.60 |
+| `aws-lc-rs`  | 4 KiB    |         8.36 |             9.09 |         7.97 |            10.34 |
+| `boring`     | 4 KiB    |        10.26 |            14.52 |         7.71 |            16.16 |
+| `ring`       | 4 KiB    |         5.06 |             8.47 |         6.97 |            10.59 |
+| `rustcrypto` | 4 KiB    |         4.35 |             4.31 |         4.31 |             4.49 |
+
+The benchmark also runs a baseline: one bare AES-256-GCM call from the same
+provider over the same total buffer, the best case FLOE could reach if
+segmentation cost nothing. With 1 MiB segments every provider is at or near
+parity with its baseline. With 4 KiB segments the gap is each provider's fixed
+per-call AEAD cost (per-seal GCM context setup, IV install, tag finalize, FFI),
+which FLOE cannot amortize across such small segments.
+
+In GiB/sec, in place, higher is better
+
+| Provider     | Segments | FLOE encrypt | Bare encrypt | FLOE decrypt | Bare decrypt |
+|--------------|----------|-------------:|-------------:|-------------:|-------------:|
+| `aws-lc-rs`  | 1 MiB    |        19.82 |        20.03 |        19.93 |        21.41 |
+| `boring`     | 1 MiB    |        17.82 |        18.15 |        16.59 |        16.94 |
+| `ring`       | 1 MiB    |        11.43 |        11.71 |        12.38 |        12.27 |
+| `rustcrypto` | 1 MiB    |         4.74 |         5.03 |         4.60 |         5.01 |
+| `aws-lc-rs`  | 4 KiB    |         9.09 |        19.65 |        10.34 |        21.72 |
+| `boring`     | 4 KiB    |        14.52 |        19.53 |        16.16 |        19.39 |
+| `ring`       | 4 KiB    |         8.47 |        11.06 |        10.59 |        12.59 |
+| `rustcrypto` | 4 KiB    |         4.31 |         4.97 |         4.49 |         4.89 |
 
 #### Apple M3, Rust 1.97.1
+
+These figures predate the one-pass "into" seal paths and the current
+arena-based in-place benchmark and will read low until refreshed on that
+hardware.
 
 In GiB/sec, higher is better
 
