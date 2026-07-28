@@ -59,6 +59,26 @@ mod aead_rustcrypto {
             Ok(())
         }
 
+        /// Encrypts `plaintext` directly into `output` (`ciphertext || tag`)
+        /// in one pass through the cipher's split input/output buffer.
+        #[inline]
+        pub(crate) fn seal_into(
+            &self,
+            nonce: &[u8; 12],
+            aad: &[u8],
+            plaintext: &[u8],
+            output: &mut [u8],
+        ) -> Result<()> {
+            let (ciphertext, tag_out) = output.split_at_mut(plaintext.len());
+            let in_out = InOutBuf::new(plaintext, ciphertext).map_err(|_| Error::CryptoFailure)?;
+            let tag = self
+                .0
+                .encrypt_inout_detached(&Nonce::<Aes256Gcm>::from(*nonce), aad, in_out)
+                .map_err(|_| Error::CryptoFailure)?;
+            tag_out.copy_from_slice(&tag);
+            Ok(())
+        }
+
         #[inline]
         pub(crate) fn open(
             &self,
@@ -517,6 +537,8 @@ impl AeadKey {
             Self::AwsLcRs(key) => key.seal_into(nonce, aad, plaintext, output),
             #[cfg(feature = "boring")]
             Self::Boring(key) => key.seal_into(nonce, aad, plaintext, output),
+            #[cfg(feature = "rustcrypto")]
+            Self::RustCrypto(key) => key.seal_into(nonce, aad, plaintext, output),
             _ => {
                 let (ciphertext, tag_out) = output.split_at_mut(plaintext.len());
                 ciphertext.copy_from_slice(plaintext);
