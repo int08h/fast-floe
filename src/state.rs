@@ -300,15 +300,8 @@ fn encrypt_segment_into_inner(
             required,
         });
     }
-    let nonce = nonces.next()?;
+    let nonce = write_segment_framing(nonces, output, kind, required)?;
     let key = keys.key_for_position(context, position)?;
-    let prefix = match kind {
-        SegmentKind::NonFinal => u32::MAX,
-        SegmentKind::Final => u32::try_from(required).map_err(|_| Error::LengthOverflow)?,
-    };
-    output[..SEGMENT_PREFIX_LENGTH].copy_from_slice(&prefix.to_be_bytes());
-    output[SEGMENT_PREFIX_LENGTH..SEGMENT_PAYLOAD_OFFSET].copy_from_slice(&nonce);
-
     let segment_aad = segment_aad(position, kind);
     key.seal_into(
         &nonce,
@@ -336,54 +329,38 @@ fn encrypt_segment_in_place_inner(
             required,
         });
     }
-    encrypt_prepared_segment(
-        context,
-        keys,
-        nonces,
-        buffer,
-        plaintext_length,
-        position,
-        kind,
-        required,
-    )
+    let nonce = write_segment_framing(nonces, buffer, kind, required)?;
+    let key = keys.key_for_position(context, position)?;
+    let segment_aad = segment_aad(position, kind);
+    let tag_start = SEGMENT_PAYLOAD_OFFSET + plaintext_length;
+    let mut tag = [0u8; AEAD_TAG_LENGTH];
+    key.seal(
+        &nonce,
+        &segment_aad,
+        &mut buffer[SEGMENT_PAYLOAD_OFFSET..tag_start],
+        &mut tag,
+    )?;
+    buffer[tag_start..required].copy_from_slice(&tag);
+    Ok(required)
 }
 
+/// Writes the length prefix and a fresh nonce into the segment's framing
+/// bytes and returns the nonce. The payload region is not touched.
 #[inline]
-#[allow(clippy::too_many_arguments)]
-fn encrypt_prepared_segment(
-    context: &MessageContext,
-    keys: &mut KeyCache,
+fn write_segment_framing(
     nonces: &mut NonceGenerator,
     output: &mut [u8],
-    plaintext_length: usize,
-    position: u64,
     kind: SegmentKind,
     required: usize,
-) -> Result<usize> {
-    let nonce = nonces.next()?;
-    let key = keys.key_for_position(context, position)?;
+) -> Result<[u8; AEAD_IV_LENGTH]> {
     let prefix = match kind {
         SegmentKind::NonFinal => u32::MAX,
         SegmentKind::Final => u32::try_from(required).map_err(|_| Error::LengthOverflow)?,
     };
     output[..SEGMENT_PREFIX_LENGTH].copy_from_slice(&prefix.to_be_bytes());
-
-    let nonce_start = SEGMENT_PREFIX_LENGTH;
-    let ciphertext_start = nonce_start + AEAD_IV_LENGTH;
-    let tag_start = ciphertext_start + plaintext_length;
-    let segment_aad = segment_aad(position, kind);
-    let mut tag = [0u8; AEAD_TAG_LENGTH];
-
-    key.seal(
-        &nonce,
-        &segment_aad,
-        &mut output[ciphertext_start..tag_start],
-        &mut tag,
-    )?;
-
-    output[nonce_start..ciphertext_start].copy_from_slice(&nonce);
-    output[tag_start..required].copy_from_slice(&tag);
-    Ok(required)
+    let nonce = nonces.next()?;
+    output[SEGMENT_PREFIX_LENGTH..SEGMENT_PAYLOAD_OFFSET].copy_from_slice(&nonce);
+    Ok(nonce)
 }
 
 #[inline]
