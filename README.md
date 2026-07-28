@@ -382,8 +382,8 @@ FLOE performance in GiB/sec, higher is better
 | `ring`       | 4 KiB    |         5.06 |             8.47 |         6.97 |            10.59 |
 | `rustcrypto` | 4 KiB    |         4.35 |             4.31 |         4.31 |             4.49 |
 
-Compared to "bare" AES-256-GCM from each provider, FLOE is ~1%-5% slower on 1 MiB segments
-(the FLOE overhead is easily amortized), and on small 4 KiB segments FLOE is ~10%-50% slower. 
+Compared to "bare" AES-256-GCM from each provider, FLOE on Zen5 is within ~1% on 1 MiB segments
+(the FLOE overhead is easily amortized), and FLOE is ~10%-40% slower on 4 KiB segments. 
 
 #### Apple M3, Rust 1.97.1
 
@@ -401,8 +401,7 @@ FLOE performance in GiB/sec, higher is better
 | `rustcrypto` | 4 KiB    |         3.45 |             3.47 |         3.48 |             3.45 |
 
 Compared to "bare" AES-256-GCM from each provider, FLOE on the M3 is within ~1% on 1 MiB
-segments with the native providers (`rustcrypto` is ~20% slower), and ~13%-24% slower on
-4 KiB segments.
+segments and ~15%-25% slower on 4 KiB segments.
 
 ## License
 
