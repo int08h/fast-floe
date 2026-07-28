@@ -382,8 +382,8 @@ FLOE performance in GiB/sec, higher is better
 | `ring`       | 4 KiB    |         5.06 |             8.47 |         6.97 |            10.59 |
 | `rustcrypto` | 4 KiB    |         4.35 |             4.31 |         4.31 |             4.49 |
 
-Compared to "bare" AES-256-GCM from each provider, FLOE is ~1%-5% slower on 1 MiB segments
-(the FLOE overhead is easily amortized), and on small 4 KiB segments FLOE is ~10%-50% slower. 
+Compared to "bare" AES-256-GCM from each provider, FLOE on Zen5 is within ~1% on 1 MiB segments
+(the FLOE overhead is easily amortized), and FLOE is ~10%-40% slower on 4 KiB segments. 
 
 #### Apple M3, Rust 1.97.1
 
@@ -391,14 +391,17 @@ FLOE performance in GiB/sec, higher is better
 
 | Provider     | Segments | Encrypt into | Encrypt in place | Decrypt into | Decrypt in place |
 |--------------|----------|-------------:|-----------------:|-------------:|-----------------:|
-| `aws-lc-rs`  | 1 MiB    |         6.99 |             8.62 |         8.73 |             8.75 |
-| `boring`     | 1 MiB    |         6.05 |             7.17 |         6.07 |             7.14 |
-| `ring`       | 1 MiB    |         6.05 |             7.17 |         6.03 |             7.17 |
-| `rustcrypto` | 1 MiB    |         3.33 |             3.71 |         3.63 |             3.71 |
-| `aws-lc-rs`  | 4 KiB    |         6.07 |             7.13 |         7.30 |             7.60 |
-| `boring`     | 4 KiB    |         5.73 |             6.47 |         5.80 |             6.51 |
-| `ring`       | 4 KiB    |         5.42 |             6.23 |         5.74 |             6.53 |
-| `rustcrypto` | 4 KiB    |         3.19 |             3.44 |         3.39 |             3.45 |
+| `aws-lc-rs`  | 1 MiB    |         8.63 |             8.65 |         8.75 |             8.76 |
+| `boring`     | 1 MiB    |         7.22 |             7.20 |         6.08 |             7.15 |
+| `ring`       | 1 MiB    |         6.08 |             7.20 |         6.03 |             7.17 |
+| `rustcrypto` | 1 MiB    |         3.56 |             3.63 |         3.62 |             3.65 |
+| `aws-lc-rs`  | 4 KiB    |         6.97 |             7.39 |         7.40 |             7.68 |
+| `boring`     | 4 KiB    |         6.51 |             6.22 |         5.82 |             6.64 |
+| `ring`       | 4 KiB    |         5.46 |             6.09 |         5.77 |             6.14 |
+| `rustcrypto` | 4 KiB    |         3.45 |             3.47 |         3.48 |             3.45 |
+
+Compared to "bare" AES-256-GCM from each provider, FLOE on the M3 is within ~1% on 1 MiB
+segments and ~15%-25% slower on 4 KiB segments.
 
 ## License
 
