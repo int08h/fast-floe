@@ -275,6 +275,26 @@ mod aead_boring {
             Ok(())
         }
 
+        /// Encrypts `plaintext` directly into `output` (`ciphertext || tag`)
+        /// in one pass by passing it as `seal_scatter`'s extra input.
+        #[inline]
+        pub(crate) fn seal_into(
+            &self,
+            nonce: &[u8; 12],
+            aad: &[u8],
+            plaintext: &[u8],
+            output: &mut [u8],
+        ) -> Result<()> {
+            let written = self
+                .0
+                .seal_scatter(nonce, &mut [], output, Some(plaintext), aad)
+                .map_err(|_| Error::CryptoFailure)?;
+            if written.len() != plaintext.len() + AEAD_TAG_LENGTH {
+                return Err(Error::CryptoFailure);
+            }
+            Ok(())
+        }
+
         #[inline]
         pub(crate) fn open(
             &self,
@@ -495,6 +515,8 @@ impl AeadKey {
         match self {
             #[cfg(feature = "aws-lc-rs")]
             Self::AwsLcRs(key) => key.seal_into(nonce, aad, plaintext, output),
+            #[cfg(feature = "boring")]
+            Self::Boring(key) => key.seal_into(nonce, aad, plaintext, output),
             _ => {
                 let (ciphertext, tag_out) = output.split_at_mut(plaintext.len());
                 ciphertext.copy_from_slice(plaintext);
