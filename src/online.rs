@@ -415,7 +415,7 @@ impl Decryptor {
         self.decrypt_segment_into_framed(ciphertext_segment, framing, output)
     }
 
-    fn decrypt_segment_into_framed(
+    pub(crate) fn decrypt_segment_into_framed(
         &mut self,
         ciphertext_segment: &[u8],
         framing: crate::SegmentFraming,

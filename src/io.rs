@@ -704,6 +704,24 @@ impl<R: Read> DecryptReader<R> {
     }
 
     fn try_load_segment(&mut self) -> io::Result<()> {
+        let framing = self.fetch_segment()?;
+
+        let decryptor = self.decryptor.as_mut().ok_or_else(poisoned_error)?;
+        let plaintext_length = decryptor
+            .decrypt_segment_in_place(&mut self.buffer)
+            .map_err(decryption_error)?
+            .len();
+
+        self.finish_if_final(framing)?;
+        self.plaintext_consumed = 0;
+        self.plaintext_available = plaintext_length;
+        Ok(())
+    }
+
+    /// Reads the next segment's complete ciphertext into the reusable buffer
+    /// and returns its unauthenticated framing.
+    #[inline]
+    fn fetch_segment(&mut self) -> io::Result<SegmentFraming> {
         let mut prefix = [0; crate::SEGMENT_PREFIX_LENGTH];
         let actual = read_fully(&mut self.inner, &mut prefix)?;
         if actual != prefix.len() {
@@ -727,13 +745,11 @@ impl<R: Read> DecryptReader<R> {
                 required: LengthRequirement::Exactly(ciphertext_length),
             }));
         }
+        Ok(framing)
+    }
 
-        let decryptor = self.decryptor.as_mut().ok_or_else(poisoned_error)?;
-        let plaintext_length = decryptor
-            .decrypt_segment_in_place(&mut self.buffer)
-            .map_err(decryption_error)?
-            .len();
-
+    #[inline]
+    fn finish_if_final(&mut self, framing: SegmentFraming) -> io::Result<()> {
         if framing.is_final() {
             self.decryptor
                 .take()
@@ -742,10 +758,35 @@ impl<R: Read> DecryptReader<R> {
                 .map_err(decryption_error)?;
             self.status = StreamStatus::Finished;
         }
-
-        self.plaintext_consumed = 0;
-        self.plaintext_available = plaintext_length;
         Ok(())
+    }
+
+    fn read_segment_direct(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let result = self.try_read_segment_direct(output);
+        if result.is_err() {
+            self.status = StreamStatus::Failed;
+        }
+        result
+    }
+
+    /// Decrypts the next segment straight into the caller's buffer, skipping
+    /// the in-place open plus copy-out that sub-segment reads require.
+    fn try_read_segment_direct(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let framing = self.fetch_segment()?;
+        let written = self
+            .decryptor
+            .as_mut()
+            .ok_or_else(poisoned_error)?
+            .decrypt_segment_into_framed(
+                self.buffer.ciphertext().map_err(decryption_error)?,
+                framing,
+                output,
+            )
+            .map_err(decryption_error)?;
+        self.finish_if_final(framing)?;
+        self.plaintext_consumed = 0;
+        self.plaintext_available = 0;
+        Ok(written)
     }
 }
 
@@ -762,6 +803,9 @@ impl<R: Read> Read for DecryptReader<R> {
         if self.plaintext_consumed == self.plaintext_available {
             if self.status == StreamStatus::Finished {
                 return Ok(0);
+            }
+            if output.len() >= self.parameters().plaintext_segment_length() {
+                return self.read_segment_direct(output);
             }
             self.load_segment()?;
             if self.plaintext_consumed == self.plaintext_available {
@@ -928,6 +972,105 @@ mod tests {
             assert_eq!(recovered, plaintext);
             assert!(reader.is_finished());
         }
+    }
+
+    #[test]
+    fn decrypt_reader_serves_whole_segments_into_large_buffers() {
+        // Given message lengths at and around every segment boundary
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let capacity = parameters.plaintext_segment_length();
+        for length in [0, 1, capacity - 1, capacity, capacity + 1, 3 * capacity + 7] {
+            let plaintext: Vec<u8> = (0..length)
+                .map(|index| u8::try_from(index % 251).unwrap())
+                .collect();
+            let ciphertext = encrypt(&test_key(), b"io", parameters, &plaintext).unwrap();
+
+            // When the plaintext is pulled through segment-sized reads
+            let mut reader =
+                DecryptReader::new(Cursor::new(&ciphertext), &test_key(), b"io").unwrap();
+            let mut recovered = Vec::new();
+            let mut chunk = vec![0u8; capacity];
+            loop {
+                let read = reader.read(&mut chunk).unwrap();
+                if read == 0 {
+                    break;
+                }
+                recovered.extend_from_slice(&chunk[..read]);
+            }
+
+            // Then the reader finishes cleanly and the plaintext matches
+            assert_eq!(recovered, plaintext, "direct read failed at {length}");
+            assert!(reader.is_finished(), "not finished at length {length}");
+            reader.try_finish().unwrap();
+        }
+    }
+
+    #[test]
+    fn decrypt_reader_alternates_small_and_segment_sized_reads() {
+        // Given a multi-segment message
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let capacity = parameters.plaintext_segment_length();
+        let plaintext: Vec<u8> = (0..4 * capacity + 13)
+            .map(|index| u8::try_from(index % 249).unwrap())
+            .collect();
+        let ciphertext = encrypt(&test_key(), b"io", parameters, &plaintext).unwrap();
+        let mut reader = DecryptReader::new(Cursor::new(&ciphertext), &test_key(), b"io").unwrap();
+
+        // When reads alternate between sub-segment and whole-segment sizes
+        let mut recovered = Vec::new();
+        let mut small = [0u8; 7];
+        let mut large = vec![0u8; capacity];
+        let mut use_small = true;
+        loop {
+            let read = if use_small {
+                let read = reader.read(&mut small).unwrap();
+                recovered.extend_from_slice(&small[..read]);
+                read
+            } else {
+                let read = reader.read(&mut large).unwrap();
+                recovered.extend_from_slice(&large[..read]);
+                read
+            };
+            if read == 0 {
+                break;
+            }
+            use_small = !use_small;
+        }
+
+        // Then buffered and direct segments reassemble the plaintext
+        assert_eq!(recovered, plaintext);
+        assert!(reader.is_finished());
+        reader.try_finish().unwrap();
+    }
+
+    #[test]
+    fn direct_segment_reads_preserve_a_following_frame() {
+        // Given one complete message followed by a second frame
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let capacity = parameters.plaintext_segment_length();
+        let plaintext = vec![0x42; capacity + 9];
+        let mut framed = encrypt(&test_key(), b"io", parameters, &plaintext).unwrap();
+        framed.extend_from_slice(b"next frame");
+
+        // When the message is drained with whole-segment reads
+        let mut reader = DecryptReader::new(Cursor::new(framed), &test_key(), b"io").unwrap();
+        let mut recovered = Vec::new();
+        let mut chunk = vec![0u8; capacity];
+        loop {
+            let read = reader.read(&mut chunk).unwrap();
+            if read == 0 {
+                break;
+            }
+            recovered.extend_from_slice(&chunk[..read]);
+        }
+        assert_eq!(recovered, plaintext);
+
+        // Then the frame finisher leaves the next frame unread
+        let inner = reader.finish_frame().unwrap();
+        assert_eq!(
+            &inner.get_ref()[usize::try_from(inner.position()).unwrap()..],
+            b"next frame"
+        );
     }
 
     #[test]
