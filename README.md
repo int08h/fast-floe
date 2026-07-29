@@ -406,17 +406,31 @@ FLOE segment-oriented performance in GiB/sec, higher is better.
 
 | Provider     | Segments | Encrypt into | Encrypt in place | Decrypt into | Decrypt in place |
 |--------------|----------|-------------:|-----------------:|-------------:|-----------------:|
-| `aws-lc-rs`  | 1 MiB    |         8.63 |             8.65 |         8.75 |             8.76 |
-| `boring`     | 1 MiB    |         7.22 |             7.20 |         6.08 |             7.15 |
-| `ring`       | 1 MiB    |         6.08 |             7.20 |         6.03 |             7.17 |
-| `rustcrypto` | 1 MiB    |         3.56 |             3.63 |         3.62 |             3.65 |
-| `aws-lc-rs`  | 4 KiB    |         6.97 |             7.39 |         7.40 |             7.68 |
-| `boring`     | 4 KiB    |         6.51 |             6.22 |         5.82 |             6.64 |
-| `ring`       | 4 KiB    |         5.46 |             6.09 |         5.77 |             6.14 |
-| `rustcrypto` | 4 KiB    |         3.45 |             3.47 |         3.48 |             3.45 |
+| `aws-lc-rs`  | 1 MiB    |         8.61 |             8.61 |         8.67 |             8.76 |
+| `boring`     | 1 MiB    |         7.19 |             7.22 |         6.01 |             7.19 |
+| `ring`       | 1 MiB    |         6.05 |             7.18 |         6.06 |             7.17 |
+| `rustcrypto` | 1 MiB    |         5.77 |             5.75 |         5.80 |             5.77 |
+| `aws-lc-rs`  | 4 KiB    |         6.92 |             7.39 |         7.28 |             7.52 |
+| `boring`     | 4 KiB    |         6.47 |             6.51 |         5.85 |             6.63 |
+| `ring`       | 4 KiB    |         5.43 |             6.16 |         5.80 |             6.40 |
+| `rustcrypto` | 4 KiB    |         5.54 |             5.50 |         5.59 |             5.56 |
 
-Compared to "bare" AES-256-GCM from each provider, FLOE on the M3 is within ~1% on 1 MiB
-segments and ~15%-25% slower on 4 KiB segments.
+Compared to "bare" AES-256-GCM from each provider, FLOE "in place" on the M3 is within ~1%
+on 1 MiB segments and roughly 3%-15% slower on 4 KiB segments.
+
+The `std::io` adapter and random-access reader results on the M3, measured the same way as
+the Zen 5 table above:
+
+| Provider     | Segments | EncryptWriter | EncryptReader | DecryptReader | Reader (seq) | Reader (range) |
+|--------------|----------|--------------:|--------------:|--------------:|-------------:|---------------:|
+| `aws-lc-rs`  | 1 MiB    |          8.33 |          7.34 |          7.14 |         6.52 |           6.98 |
+| `boring`     | 1 MiB    |          6.89 |          6.23 |          5.48 |         5.56 |           5.60 |
+| `ring`       | 1 MiB    |          6.28 |          5.64 |          5.50 |         5.62 |           5.61 |
+| `rustcrypto` | 1 MiB    |          5.64 |          5.10 |          5.15 |         4.71 |           4.97 |
+| `aws-lc-rs`  | 4 KiB    |          7.36 |          6.68 |          6.78 |         6.14 |           6.57 |
+| `boring`     | 4 KiB    |          6.49 |          5.94 |          5.53 |         5.49 |           5.45 |
+| `ring`       | 4 KiB    |          5.59 |          5.29 |          5.49 |         5.18 |           5.40 |
+| `rustcrypto` | 4 KiB    |          5.55 |          4.98 |          5.06 |         4.77 |           5.07 |
 
 ## License
 
