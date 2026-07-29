@@ -36,6 +36,10 @@ pub struct Reader<R> {
     scratch: SegmentBuffer,
     plaintext_position: u64,
     cached_position: Option<u64>,
+    /// The wrapped reader's byte position when known, letting contiguous
+    /// segment accesses skip redundant seeks (which would also discard any
+    /// `BufReader` buffer). `None` whenever the position is uncertain.
+    inner_position: Option<u64>,
 }
 
 impl<R: Read + Seek> Reader<R> {
@@ -97,6 +101,7 @@ impl<R: Read + Seek> Reader<R> {
             scratch: SegmentBuffer::new(parameters),
             plaintext_position: 0,
             cached_position: None,
+            inner_position: None,
         };
 
         reader.load_segment(layout.final_segment())?;
@@ -260,7 +265,11 @@ impl<R: Read + Seek> Reader<R> {
     }
 
     /// Returns a mutable reference to the wrapped seekable reader.
-    pub const fn get_mut(&mut self) -> &mut R {
+    ///
+    /// This discards the tracked stream position, so the next segment access
+    /// seeks explicitly even if the wrapped reader was not moved.
+    pub fn get_mut(&mut self) -> &mut R {
+        self.inner_position = None;
         &mut self.inner
     }
 
@@ -285,9 +294,18 @@ impl<R: Read + Seek> Reader<R> {
             .message_start
             .checked_add(segment.ciphertext_offset())
             .ok_or_else(length_overflow)?;
+        self.seek_inner_to(offset)
+    }
 
+    /// Seeks the wrapped reader to `offset`, skipping the call when the
+    /// tracked position already matches.
+    fn seek_inner_to(&mut self, offset: u64) -> io::Result<()> {
+        if self.inner_position == Some(offset) {
+            return Ok(());
+        }
+        self.inner_position = None;
         self.inner.seek(SeekFrom::Start(offset))?;
-
+        self.inner_position = Some(offset);
         Ok(())
     }
 
@@ -305,12 +323,20 @@ impl<R: Read + Seek> Reader<R> {
         self.cached_position = None;
         self.seek_to_segment(segment)?;
 
+        // The stream position is uncertain while the read is outstanding: a
+        // failed or short read leaves the reader somewhere inside the segment.
+        let position_after_read = self.inner_position.take().and_then(|position| {
+            position.checked_add(length_usize_to_u64(segment.ciphertext_length()))
+        });
+
         let ciphertext = self
             .scratch
             .prepare_ciphertext(segment.ciphertext_length())
             .map_err(decryption_error)?;
 
-        read_exact_segment(&mut self.inner, ciphertext)
+        read_exact_segment(&mut self.inner, ciphertext)?;
+        self.inner_position = position_after_read;
+        Ok(())
     }
 
     fn load_segment(&mut self, segment: SegmentLayout) -> io::Result<()> {
@@ -341,13 +367,11 @@ impl<R: Read + Seek> Reader<R> {
     }
 
     fn seek_to_body_start(&mut self) -> io::Result<()> {
-        self.inner.seek(SeekFrom::Start(
-            self.message_start
-                .checked_add(HEADER_LENGTH_U64)
-                .ok_or_else(length_overflow)?,
-        ))?;
-
-        Ok(())
+        let offset = self
+            .message_start
+            .checked_add(HEADER_LENGTH_U64)
+            .ok_or_else(length_overflow)?;
+        self.seek_inner_to(offset)
     }
 }
 
@@ -456,11 +480,33 @@ fn validate_header_bound(ciphertext_length: u64) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::io::Cursor;
+    use std::rc::Rc;
 
     use super::*;
     use crate::key::test_key;
     use crate::{Parameters, encrypt};
+
+    /// Delegating reader that counts how many `seek` calls reach the
+    /// underlying stream.
+    struct SeekCounting<R> {
+        inner: R,
+        seeks: Rc<Cell<usize>>,
+    }
+
+    impl<R: Read> Read for SeekCounting<R> {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            self.inner.read(output)
+        }
+    }
+
+    impl<R: Seek> Seek for SeekCounting<R> {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.seeks.set(self.seeks.get() + 1);
+            self.inner.seek(position)
+        }
+    }
 
     fn framed_reader_fixture() -> (Reader<Cursor<Vec<u8>>>, Vec<u8>, Parameters) {
         let key = test_key();
@@ -638,6 +684,68 @@ mod tests {
             reader.read_range(5..2).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn contiguous_segment_reads_skip_redundant_seeks() {
+        // Given a reader over a three-segment message whose underlying
+        // stream counts seek calls
+        let key = test_key();
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let plaintext: Vec<u8> = (0..2 * parameters.plaintext_segment_length() + 11)
+            .map(|position| u8::try_from(position % 251).unwrap())
+            .collect();
+        let ciphertext = encrypt(&key, b"seek count", parameters, &plaintext).unwrap();
+        let seeks = Rc::new(Cell::new(0));
+        let counting = SeekCounting {
+            inner: Cursor::new(ciphertext),
+            seeks: Rc::clone(&seeks),
+        };
+        let mut reader = Reader::new(counting, &key, b"seek count").unwrap();
+
+        // When the plaintext is streamed sequentially after construction
+        seeks.set(0);
+        let mut streamed = Vec::new();
+        reader.read_to_end(&mut streamed).unwrap();
+
+        // Then every segment followed the previous one and no seek was needed
+        assert_eq!(streamed, plaintext);
+        assert_eq!(seeks.get(), 0, "contiguous reads must not reseek");
+
+        // When a whole-message range read follows the sequential pass
+        seeks.set(0);
+        assert_eq!(reader.read_range(..).unwrap(), plaintext);
+
+        // Then only the initial repositioning to the first segment seeks
+        assert_eq!(seeks.get(), 1, "only the first segment requires a seek");
+    }
+
+    #[test]
+    fn moving_the_inner_reader_through_get_mut_is_tolerated() {
+        // Given a reader over a three-segment message
+        let key = test_key();
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let segment_length = parameters.plaintext_segment_length();
+        let plaintext: Vec<u8> = (0..2 * segment_length + 17)
+            .map(|position| u8::try_from(position % 251).unwrap())
+            .collect();
+        let ciphertext = encrypt(&key, b"get_mut", parameters, &plaintext).unwrap();
+        let mut reader = Reader::new(Cursor::new(ciphertext), &key, b"get_mut").unwrap();
+        assert_eq!(
+            reader.read_segment(1).unwrap(),
+            plaintext[segment_length..2 * segment_length]
+        );
+
+        // When the wrapped reader is repositioned behind the reader's back
+        reader.get_mut().seek(SeekFrom::Start(0)).unwrap();
+
+        // Then subsequent segment reads reposition explicitly and still
+        // authenticate the correct segments
+        assert_eq!(
+            reader.read_segment(2).unwrap(),
+            plaintext[2 * segment_length..]
+        );
+        assert_eq!(reader.read_segment(0).unwrap(), plaintext[..segment_length]);
     }
 
     #[test]
