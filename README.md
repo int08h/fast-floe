@@ -359,9 +359,10 @@ Run all provider and segment-size benchmarks with:
 
 ### Benchmark results
 
-Median throughput in GiB/s with each provider compiled solo with `-C target-cpu=native`. Each
-benchmark trial sizes its buffer to be at least 4x the detected last-level-cache size to ensure
-we're reaching actual memory, not spinning in cache.
+Median throughput in GiB/s with each provider compiled solo with `-C target-cpu=native` and a
+single codegen unit (the bench profile pins `codegen-units = 1` so codegen-unit partitioning
+does not add build-to-build noise). Each benchmark trial sizes its buffer to be at least 4x the
+detected last-level-cache size to ensure we're reaching actual memory, not spinning in cache.
 
 The "into" columns encrypt or decrypt into a separate output buffer in one pass
 (using scatter/gather when the provider supports it) while "in place" overwrite
@@ -373,21 +374,41 @@ FLOE performance in GiB/sec, higher is better
 
 | Provider     | Segments | Encrypt into | Encrypt in place | Decrypt into | Decrypt in place |
 |--------------|----------|-------------:|-----------------:|-------------:|-----------------:|
-| `aws-lc-rs`  | 1 MiB    |        13.06 |            19.82 |        14.13 |            19.93 |
-| `boring`     | 1 MiB    |        12.31 |            17.82 |         8.41 |            16.59 |
-| `ring`       | 1 MiB    |         6.32 |            11.43 |         6.14 |            12.38 |
-| `rustcrypto` | 1 MiB    |         4.65 |             4.74 |         4.88 |             4.60 |
-| `aws-lc-rs`  | 4 KiB    |         8.36 |             9.09 |         7.97 |            10.34 |
-| `boring`     | 4 KiB    |        10.26 |            14.52 |         7.71 |            16.16 |
-| `ring`       | 4 KiB    |         5.06 |             8.47 |         6.97 |            10.59 |
-| `rustcrypto` | 4 KiB    |         4.35 |             4.31 |         4.31 |             4.49 |
+| `aws-lc-rs`  | 1 MiB    |        13.88 |            21.50 |        12.05 |            22.25 |
+| `boring`     | 1 MiB    |        11.98 |            17.72 |         8.56 |            19.29 |
+| `ring`       | 1 MiB    |         6.18 |            11.87 |         6.43 |            12.90 |
+| `rustcrypto` | 1 MiB    |         4.84 |             4.87 |         4.93 |             4.94 |
+| `aws-lc-rs`  | 4 KiB    |         8.85 |            10.15 |         9.18 |            11.31 |
+| `boring`     | 4 KiB    |        10.95 |            14.76 |         7.98 |            16.12 |
+| `ring`       | 4 KiB    |         5.99 |             9.15 |         6.91 |            10.31 |
+| `rustcrypto` | 4 KiB    |         4.67 |             4.84 |         4.81 |             4.59 |
 
-Compared to "bare" AES-256-GCM from each provider, FLOE on Zen5 is within ~1% on 1 MiB segments
-(the FLOE overhead is easily amortized), and FLOE is ~10%-40% slower on 4 KiB segments. 
+Compared to "bare" AES-256-GCM from each provider, FLOE in-place on Zen5 is within ~5% on
+1 MiB segments for `aws-lc-rs`, `ring`, and `rustcrypto` (`boring` is ~12% slower), and
+roughly 5%-45% slower on 4 KiB segments depending on the provider's per-call fixed costs.
+
+The `std::io` adapters and the random-access reader add stream framing, buffering, and (for
+the random-access reader) per-segment positioning on top of the segment operations above.
+These figures stream 128 MiB messages; the reader columns use whole-segment read buffers,
+which take the copy-free direct path. Sub-segment reads fall back to an internal buffer plus
+one copy. Run them with `cargo bench --bench io_adapters`.
+
+| Provider     | Segments | EncryptWriter | EncryptReader | DecryptReader | Reader (seq) | Reader (range) |
+|--------------|----------|--------------:|--------------:|--------------:|-------------:|---------------:|
+| `aws-lc-rs`  | 1 MiB    |         18.07 |         13.79 |         12.35 |        10.85 |           9.48 |
+| `boring`     | 1 MiB    |         16.62 |         13.27 |         10.22 |        10.56 |           6.96 |
+| `ring`       | 1 MiB    |          8.22 |          7.48 |          7.34 |         7.55 |           5.63 |
+| `rustcrypto` | 1 MiB    |          4.89 |          4.18 |          4.24 |         3.87 |           3.92 |
+| `aws-lc-rs`  | 4 KiB    |         11.91 |         10.89 |          9.03 |         6.81 |           6.93 |
+| `boring`     | 4 KiB    |         14.96 |          9.42 |          8.55 |         8.97 |           6.81 |
+| `ring`       | 4 KiB    |          8.12 |          7.29 |          7.82 |         7.10 |           5.96 |
+| `rustcrypto` | 4 KiB    |          4.97 |          4.43 |          3.96 |         3.78 |           4.03 |
 
 #### Apple M3, Rust 1.97.1
 
-FLOE performance in GiB/sec, higher is better
+FLOE performance in GiB/sec, higher is better. These results predate the pinned
+single-codegen-unit bench profile and the adapter benchmarks; they will be refreshed
+in a future pass on that hardware.
 
 | Provider     | Segments | Encrypt into | Encrypt in place | Decrypt into | Decrypt in place |
 |--------------|----------|-------------:|-----------------:|-------------:|-----------------:|
