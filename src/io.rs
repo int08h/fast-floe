@@ -230,6 +230,27 @@ impl<W: Write> EncryptWriter<W> {
             Ok(())
         })
     }
+
+    /// Encrypts one full non-final segment straight from the caller's input,
+    /// skipping the staging copy into the segment buffer. The one-pass
+    /// backend seal writes ciphertext and tag directly into the reusable
+    /// storage the adapter then hands to the wrapped writer.
+    fn write_segment_direct(&mut self, chunk: &[u8]) -> io::Result<usize> {
+        self.poison_on_error(|writer| {
+            let written = writer
+                .encryptor
+                .as_mut()
+                .ok_or_else(poisoned_error)?
+                .encrypt_non_final_segment_into(chunk, writer.buffer.raw_mut())
+                .map_err(encryption_error)?;
+            writer.buffer.mark_ciphertext(written);
+            writer
+                .inner
+                .write_all(writer.buffer.ciphertext().map_err(encryption_error)?)?;
+            Ok(())
+        })?;
+        Ok(chunk.len())
+    }
 }
 
 impl<W: Write> Write for EncryptWriter<W> {
@@ -248,6 +269,11 @@ impl<W: Write> Write for EncryptWriter<W> {
             StreamStatus::Failed => return Err(poisoned_error()),
         }
 
+        let capacity = self.parameters().plaintext_segment_length();
+        if input.len() >= capacity && self.buffer.plaintext_length().is_err() {
+            return self.write_segment_direct(&input[..capacity]);
+        }
+
         let copied = self.buffer.extend_plaintext(input);
         if copied > 0 {
             return Ok(copied);
@@ -255,6 +281,9 @@ impl<W: Write> Write for EncryptWriter<W> {
 
         // The buffer holds one full segment: emit it and start the next.
         self.emit_non_final()?;
+        if input.len() >= capacity {
+            return self.write_segment_direct(&input[..capacity]);
+        }
         Ok(self.buffer.extend_plaintext(input))
     }
 
@@ -825,6 +854,53 @@ mod tests {
                 "writer round trip failed at length {length}"
             );
         }
+    }
+
+    #[test]
+    fn writer_mixes_buffered_and_full_segment_writes() {
+        // Given plaintext delivered as a partial write, one huge write
+        // covering several segments, and a small tail
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let capacity = parameters.plaintext_segment_length();
+        let plaintext: Vec<u8> = (0..3 * capacity + 41)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect();
+        let mut writer = EncryptWriter::new(Vec::new(), &test_key(), b"io", parameters).unwrap();
+
+        // When the pieces are written in mixed sizes
+        writer.write_all(&plaintext[..17]).unwrap();
+        writer.write_all(&plaintext[17..3 * capacity]).unwrap();
+        writer.write_all(&plaintext[3 * capacity..]).unwrap();
+        let ciphertext = writer.finish().unwrap();
+
+        // Then the message round-trips regardless of which path each
+        // write took
+        assert_eq!(decrypt(&test_key(), b"io", &ciphertext).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn writer_consumes_at_most_one_segment_per_write_call() {
+        // Given an empty writer and input longer than one segment
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let capacity = parameters.plaintext_segment_length();
+        let input = vec![0x31; capacity + 100];
+        let mut writer = EncryptWriter::new(Vec::new(), &test_key(), b"io", parameters).unwrap();
+
+        // When a single write is issued
+        // Then exactly one full segment is consumed and emitted
+        assert_eq!(writer.write(&input).unwrap(), capacity);
+        assert_eq!(
+            writer.get_ref().len(),
+            Header::LEN + parameters.ciphertext_segment_length()
+        );
+
+        // Then the remainder buffers and the whole message round-trips
+        assert_eq!(writer.write(&input[capacity..]).unwrap(), 100);
+        let ciphertext = writer.finish().unwrap();
+        assert_eq!(
+            decrypt(&test_key(), b"io", &ciphertext).unwrap(),
+            input[..capacity + 100]
+        );
     }
 
     #[test]
