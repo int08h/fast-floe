@@ -396,6 +396,32 @@ impl<R: Read> EncryptReader<R> {
     }
 
     fn try_load_segment(&mut self) -> io::Result<()> {
+        let is_final = self.fill_plaintext()?;
+        self.ciphertext_position = 0;
+        self.ciphertext_length = if is_final {
+            let encryptor = self.encryptor.take().ok_or_else(poisoned_error)?;
+            match encryptor.encrypt_final_segment_in_place(&mut self.buffer) {
+                Ok(encrypted) => {
+                    self.status = StreamStatus::Finished;
+                    encrypted.len()
+                }
+                Err(error) => return Err(encryption_error(error.into_error())),
+            }
+        } else {
+            self.encryptor
+                .as_mut()
+                .ok_or_else(poisoned_error)?
+                .encrypt_non_final_segment_in_place(&mut self.buffer)
+                .map_err(encryption_error)?
+                .len()
+        };
+        Ok(())
+    }
+
+    /// Reads the next segment's plaintext into the reusable buffer, managing
+    /// the one-byte lookahead, and returns whether the source is exhausted
+    /// (making this the final segment).
+    fn fill_plaintext(&mut self) -> io::Result<bool> {
         let capacity = self.parameters().plaintext_segment_length();
         let plaintext = self
             .buffer
@@ -425,25 +451,41 @@ impl<R: Read> EncryptReader<R> {
         self.buffer
             .truncate_plaintext(plaintext_length)
             .map_err(encryption_error)?;
-        self.ciphertext_position = 0;
-        self.ciphertext_length = if is_final {
+        Ok(is_final)
+    }
+
+    fn emit_segment_direct(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let result = self.try_emit_segment_direct(output);
+        if result.is_err() {
+            self.status = StreamStatus::Failed;
+        }
+        result
+    }
+
+    /// Encrypts the next segment straight into the caller's buffer, skipping
+    /// the in-place seal plus copy-out that sub-segment reads require.
+    fn try_emit_segment_direct(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let is_final = self.fill_plaintext()?;
+        if is_final {
             let encryptor = self.encryptor.take().ok_or_else(poisoned_error)?;
-            match encryptor.encrypt_final_segment_in_place(&mut self.buffer) {
-                Ok(encrypted) => {
-                    self.status = StreamStatus::Finished;
-                    encrypted.len()
-                }
-                Err(error) => return Err(encryption_error(error.into_error())),
-            }
+            let written = encryptor
+                .encrypt_final_segment_into(
+                    self.buffer.plaintext().map_err(encryption_error)?,
+                    output,
+                )
+                .map_err(|error| encryption_error(error.into_error()))?;
+            self.status = StreamStatus::Finished;
+            Ok(written)
         } else {
             self.encryptor
                 .as_mut()
                 .ok_or_else(poisoned_error)?
-                .encrypt_non_final_segment_in_place(&mut self.buffer)
-                .map_err(encryption_error)?
-                .len()
-        };
-        Ok(())
+                .encrypt_non_final_segment_into(
+                    self.buffer.plaintext().map_err(encryption_error)?,
+                    output,
+                )
+                .map_err(encryption_error)
+        }
     }
 }
 
@@ -467,6 +509,9 @@ impl<R: Read> Read for EncryptReader<R> {
         if self.ciphertext_position == self.ciphertext_length {
             if self.status == StreamStatus::Finished {
                 return Ok(0);
+            }
+            if output.len() >= self.parameters().ciphertext_segment_length() {
+                return self.emit_segment_direct(output);
             }
             self.load_segment()?;
         }
@@ -789,6 +834,77 @@ mod tests {
                 "reader round trip failed at length {length}"
             );
         }
+    }
+
+    #[test]
+    fn encrypt_reader_serves_whole_segments_into_large_buffers() {
+        // Given plaintext lengths at and around every segment boundary
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let capacity = parameters.plaintext_segment_length();
+        for length in [0, 1, capacity - 1, capacity, capacity + 1, 3 * capacity + 7] {
+            let plaintext: Vec<u8> = (0..length)
+                .map(|index| u8::try_from(index % 251).unwrap())
+                .collect();
+
+            // When the ciphertext is pulled through segment-sized reads
+            let mut reader =
+                EncryptReader::new(Cursor::new(&plaintext), &test_key(), b"io", parameters)
+                    .unwrap();
+            let mut ciphertext = Vec::new();
+            let mut chunk = vec![0u8; parameters.ciphertext_segment_length()];
+            loop {
+                let read = reader.read(&mut chunk).unwrap();
+                if read == 0 {
+                    break;
+                }
+                ciphertext.extend_from_slice(&chunk[..read]);
+            }
+
+            // Then the reader finishes and the message round-trips
+            assert!(reader.is_finished(), "not finished at length {length}");
+            assert_eq!(
+                decrypt(&test_key(), b"io", &ciphertext).unwrap(),
+                plaintext,
+                "direct-read round trip failed at length {length}"
+            );
+        }
+    }
+
+    #[test]
+    fn encrypt_reader_alternates_small_and_segment_sized_reads() {
+        // Given a reader over a multi-segment message
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let capacity = parameters.plaintext_segment_length();
+        let plaintext: Vec<u8> = (0..4 * capacity + 13)
+            .map(|index| u8::try_from(index % 249).unwrap())
+            .collect();
+        let mut reader =
+            EncryptReader::new(Cursor::new(&plaintext), &test_key(), b"io", parameters).unwrap();
+
+        // When reads alternate between sub-segment and whole-segment sizes
+        let mut ciphertext = Vec::new();
+        let mut small = [0u8; 7];
+        let mut large = vec![0u8; parameters.ciphertext_segment_length()];
+        let mut use_small = true;
+        loop {
+            let read = if use_small {
+                let read = reader.read(&mut small).unwrap();
+                ciphertext.extend_from_slice(&small[..read]);
+                read
+            } else {
+                let read = reader.read(&mut large).unwrap();
+                ciphertext.extend_from_slice(&large[..read]);
+                read
+            };
+            if read == 0 {
+                break;
+            }
+            use_small = !use_small;
+        }
+
+        // Then buffered and direct segments interleave into one valid message
+        assert!(reader.is_finished());
+        assert_eq!(decrypt(&test_key(), b"io", &ciphertext).unwrap(), plaintext);
     }
 
     #[test]
