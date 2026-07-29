@@ -396,7 +396,7 @@ impl Decryptor {
     pub fn decrypt_segment(&mut self, ciphertext_segment: &[u8]) -> Result<Vec<u8>> {
         let framing = self.framing(ciphertext_segment)?;
         self.advance(framing.kind(), |state, position| {
-            state.decrypt_segment_at(ciphertext_segment, position, framing.kind())
+            state.decrypt_segment_at_framed(ciphertext_segment, position, framing)
         })
     }
 
@@ -438,7 +438,7 @@ impl Decryptor {
     ) -> Result<&'a mut [u8]> {
         let framing = self.framing(buffer.ciphertext()?)?;
         self.advance(framing.kind(), |state, position| {
-            state.decrypt_segment_in_place_at(buffer, position, framing.kind())
+            state.decrypt_segment_in_place_at_framed(buffer, position, framing)
         })
     }
 
@@ -773,6 +773,52 @@ mod tests {
                 required: LengthRequirement::Between {..},
             }) if actual == SEGMENT_OVERHEAD - 1
         ));
+    }
+
+    #[test]
+    fn online_decrypt_paths_classify_prefix_length_mismatch_identically() {
+        // Given a final segment whose slice length disagrees with the
+        // length its prefix declares
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let key = test_key();
+        let encryption = Encryptor::new(&key, b"framing consistency", parameters).unwrap();
+        let header = *encryption.header();
+        let segment = encryption.encrypt_final_segment(b"abcd").unwrap();
+        let declared = segment.len();
+        let truncated = &segment[..declared - 1];
+        let expected = || Error::InvalidCiphertextLength {
+            actual: declared - 1,
+            required: LengthRequirement::Exactly(declared),
+        };
+
+        // When each online decryption method processes it
+        // Then every path reports the same mismatch
+        let mut vec_path = Decryptor::new(&key, b"framing consistency", &header).unwrap();
+        assert_eq!(vec_path.decrypt_segment(truncated), Err(expected()));
+
+        let mut into_path = Decryptor::new(&key, b"framing consistency", &header).unwrap();
+        let mut output = [0u8; 8];
+        assert_eq!(
+            into_path.decrypt_segment_into(truncated, &mut output),
+            Err(expected())
+        );
+
+        let mut in_place_path = Decryptor::new(&key, b"framing consistency", &header).unwrap();
+        let mut buffer = SegmentBuffer::new(parameters);
+        buffer
+            .prepare_ciphertext(truncated.len())
+            .unwrap()
+            .copy_from_slice(truncated);
+        assert_eq!(
+            in_place_path.decrypt_segment_in_place(&mut buffer),
+            Err(expected())
+        );
+
+        // Then none of the failed paths consumed the segment position
+        for decryptor in [&vec_path, &into_path, &in_place_path] {
+            assert_eq!(decryptor.next_position(), 0);
+            assert!(!decryptor.is_finished());
+        }
     }
 
     #[test]

@@ -514,6 +514,27 @@ fn decrypt_segment_in_place_inner<'a>(
     kind: SegmentKind,
 ) -> Result<&'a mut [u8]> {
     let plaintext_length = validate_segment(context, ciphertext_segment, kind)?;
+    open_segment_in_place(
+        context,
+        keys,
+        ciphertext_segment,
+        position,
+        kind,
+        plaintext_length,
+    )
+}
+
+/// Opens a segment whose framing has already been validated (or supplied by
+/// a decoded [`SegmentFraming`] whose length matched the segment).
+#[inline]
+fn open_segment_in_place<'a>(
+    context: &MessageContext,
+    keys: &mut KeyCache,
+    ciphertext_segment: &'a mut [u8],
+    position: u64,
+    kind: SegmentKind,
+    plaintext_length: usize,
+) -> Result<&'a mut [u8]> {
     let key = keys.key_for_position(context, position)?;
     let (framing, ciphertext_and_tag) = ciphertext_segment.split_at_mut(SEGMENT_PAYLOAD_OFFSET);
     let nonce: &[u8; AEAD_IV_LENGTH] = framing[SEGMENT_PREFIX_LENGTH..]
@@ -525,6 +546,21 @@ fn decrypt_segment_in_place_inner<'a>(
     let segment_aad = segment_aad(position, kind);
     key.open_in_place(nonce, &segment_aad, tag, ciphertext)?;
     Ok(ciphertext)
+}
+
+/// Applies an in-place decryption outcome to the buffer's state machine:
+/// authenticated plaintext on success, an empty buffer on failure.
+fn finish_in_place_decrypt(buffer: &mut SegmentBuffer, result: Result<usize>) -> Result<&mut [u8]> {
+    match result {
+        Ok(length) => {
+            buffer.mark_plaintext(length);
+            buffer.plaintext_mut()
+        }
+        Err(error) => {
+            buffer.mark_empty();
+            Err(error)
+        }
+    }
 }
 
 #[inline]
@@ -892,22 +928,45 @@ impl DecryptionState {
             return Err(Error::InvalidParameters);
         }
         let ciphertext_length = buffer.ciphertext_length()?;
-        let result = self.decrypt_segment_in_place_raw_at(
+        let result = self
+            .decrypt_segment_in_place_raw_at(
+                &mut buffer.raw_mut()[..ciphertext_length],
+                position,
+                kind,
+            )
+            .map(|plaintext| plaintext.len());
+        finish_in_place_decrypt(buffer, result)
+    }
+
+    /// In-place decryption for a segment whose framing prefix was already
+    /// decoded, so the prefix is not parsed and validated a second time.
+    pub(crate) fn decrypt_segment_in_place_at_framed<'a>(
+        &mut self,
+        buffer: &'a mut SegmentBuffer,
+        position: u64,
+        framing: SegmentFraming,
+    ) -> Result<&'a mut [u8]> {
+        if !buffer.matches(self.parameters()) {
+            return Err(Error::InvalidParameters);
+        }
+        let ciphertext_length = buffer.ciphertext_length()?;
+        let expected = framing.ciphertext_length();
+        if ciphertext_length != expected {
+            return Err(Error::InvalidCiphertextLength {
+                actual: ciphertext_length,
+                required: LengthRequirement::Exactly(expected),
+            });
+        }
+        let result = open_segment_in_place(
+            &self.context,
+            &mut self.keys,
             &mut buffer.raw_mut()[..ciphertext_length],
             position,
-            kind,
-        );
-        match result {
-            Ok(plaintext) => {
-                let length = plaintext.len();
-                buffer.mark_plaintext(length);
-                buffer.plaintext_mut()
-            }
-            Err(error) => {
-                buffer.mark_empty();
-                Err(error)
-            }
-        }
+            framing.kind(),
+            framing.plaintext_length(),
+        )
+        .map(|plaintext| plaintext.len());
+        finish_in_place_decrypt(buffer, result)
     }
 
     /// Authenticates and decrypts a segment in caller-managed storage.
@@ -960,6 +1019,19 @@ impl DecryptionState {
             plaintext_length,
             &mut output,
         )?;
+        Ok(output)
+    }
+
+    /// Allocating decryption for a segment whose framing prefix was already
+    /// decoded, so the prefix is not parsed and validated a second time.
+    pub(crate) fn decrypt_segment_at_framed(
+        &mut self,
+        ciphertext_segment: &[u8],
+        position: u64,
+        framing: SegmentFraming,
+    ) -> Result<Vec<u8>> {
+        let mut output = vec![0u8; framing.plaintext_length()];
+        self.decrypt_segment_into_at_framed(ciphertext_segment, position, framing, &mut output)?;
         Ok(output)
     }
 
