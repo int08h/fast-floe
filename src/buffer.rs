@@ -138,6 +138,39 @@ impl SegmentBuffer {
         }
     }
 
+    /// Appends `input` to the buffered plaintext payload and returns how many
+    /// bytes were copied, stopping at one segment's payload capacity.
+    ///
+    /// A buffer holding no plaintext (empty or holding a ciphertext segment)
+    /// starts a fresh payload.
+    pub(crate) fn extend_plaintext(&mut self, input: &[u8]) -> usize {
+        let length = match self.state {
+            BufferState::Plaintext { length } => length,
+            BufferState::Empty | BufferState::Ciphertext { .. } => 0,
+        };
+        let capacity = self.parameters.plaintext_segment_length();
+        let copied = input.len().min(capacity - length);
+        let start = SEGMENT_PAYLOAD_OFFSET + length;
+        self.bytes[start..start + copied].copy_from_slice(&input[..copied]);
+        self.state = BufferState::Plaintext {
+            length: length + copied,
+        };
+        copied
+    }
+
+    /// Shrinks the buffered plaintext payload to its first `length` bytes.
+    pub(crate) fn truncate_plaintext(&mut self, length: usize) -> Result<()> {
+        let current = self.plaintext_length()?;
+        if length > current {
+            return Err(Error::InvalidPlaintextLength {
+                actual: length,
+                required: LengthRequirement::AtMost(current),
+            });
+        }
+        self.state = BufferState::Plaintext { length };
+        Ok(())
+    }
+
     pub(crate) fn raw_mut(&mut self) -> &mut [u8] {
         &mut self.bytes
     }
@@ -162,5 +195,77 @@ impl SegmentBuffer {
 impl Drop for SegmentBuffer {
     fn drop(&mut self) {
         self.bytes.zeroize();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SEGMENT_OVERHEAD;
+
+    #[test]
+    fn extend_plaintext_appends_and_saturates_at_capacity() {
+        // Given an empty reusable buffer
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let capacity = parameters.plaintext_segment_length();
+        let mut buffer = SegmentBuffer::new(parameters);
+
+        // When plaintext arrives in pieces
+        assert_eq!(buffer.extend_plaintext(b"abc"), 3);
+        assert_eq!(buffer.extend_plaintext(b"de"), 2);
+
+        // Then the payload accumulates in order
+        assert_eq!(buffer.plaintext().unwrap(), b"abcde");
+        assert_eq!(buffer.plaintext_length().unwrap(), 5);
+
+        // When more input arrives than one segment holds
+        let oversized = vec![0x5a; capacity];
+        assert_eq!(buffer.extend_plaintext(&oversized), capacity - 5);
+
+        // Then the payload stops exactly at capacity and further appends
+        // copy nothing
+        assert_eq!(buffer.plaintext_length().unwrap(), capacity);
+        assert_eq!(buffer.extend_plaintext(b"x"), 0);
+        assert_eq!(buffer.plaintext_length().unwrap(), capacity);
+    }
+
+    #[test]
+    fn extend_plaintext_starts_fresh_after_ciphertext_or_clear() {
+        // Given a buffer holding a prepared ciphertext segment
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let mut buffer = SegmentBuffer::new(parameters);
+        buffer.prepare_ciphertext(SEGMENT_OVERHEAD).unwrap();
+
+        // When plaintext is appended
+        // Then a fresh payload replaces the ciphertext state
+        assert_eq!(buffer.extend_plaintext(b"fresh"), 5);
+        assert_eq!(buffer.plaintext().unwrap(), b"fresh");
+
+        // When the buffer is cleared and appended again
+        buffer.clear();
+        assert_eq!(buffer.extend_plaintext(b"again"), 5);
+        assert_eq!(buffer.plaintext().unwrap(), b"again");
+    }
+
+    #[test]
+    fn truncate_plaintext_shrinks_but_never_grows() {
+        // Given a buffer holding five plaintext bytes
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let mut buffer = SegmentBuffer::new(parameters);
+        buffer.extend_plaintext(b"abcde");
+
+        // When the payload is truncated
+        // Then only shrinking is permitted
+        buffer.truncate_plaintext(3).unwrap();
+        assert_eq!(buffer.plaintext().unwrap(), b"abc");
+        assert!(matches!(
+            buffer.truncate_plaintext(4),
+            Err(Error::InvalidPlaintextLength { .. })
+        ));
+
+        // When the buffer holds no plaintext
+        // Then truncation reports the invalid state
+        buffer.clear();
+        assert_eq!(buffer.truncate_plaintext(0), Err(Error::InvalidBufferState));
     }
 }

@@ -98,7 +98,6 @@ pub struct EncryptWriter<W> {
     encryptor: Option<Encryptor>,
     header: Header,
     buffer: SegmentBuffer,
-    plaintext_length: usize,
     status: StreamStatus,
 }
 
@@ -118,7 +117,6 @@ impl<W: Write> EncryptWriter<W> {
             encryptor: Some(encryptor),
             header,
             buffer: SegmentBuffer::new(parameters),
-            plaintext_length: 0,
             status: StreamStatus::Open,
         })
     }
@@ -203,15 +201,16 @@ impl<W: Write> EncryptWriter<W> {
 
     fn finish_message(&mut self) -> io::Result<()> {
         let encryptor = self.encryptor.take().ok_or_else(poisoned_error)?;
-        self.buffer
-            .prepare_plaintext(self.plaintext_length)
-            .map_err(encryption_error)?;
+        if self.buffer.plaintext_length().is_err() {
+            // Nothing arrived since the last emitted segment, so the message
+            // closes with an empty final payload.
+            self.buffer.prepare_plaintext(0).map_err(encryption_error)?;
+        }
         encryptor
             .encrypt_final_segment_in_place(&mut self.buffer)
             .map_err(|error| encryption_error(error.into_error()))?;
         self.inner
             .write_all(self.buffer.ciphertext().map_err(encryption_error)?)?;
-        self.plaintext_length = 0;
         self.inner.flush()?;
         self.status = StreamStatus::Finished;
         Ok(())
@@ -219,10 +218,6 @@ impl<W: Write> EncryptWriter<W> {
 
     fn emit_non_final(&mut self) -> io::Result<()> {
         self.poison_on_error(|writer| {
-            writer
-                .buffer
-                .prepare_plaintext(writer.plaintext_length)
-                .map_err(encryption_error)?;
             writer
                 .encryptor
                 .as_mut()
@@ -232,7 +227,6 @@ impl<W: Write> EncryptWriter<W> {
             writer
                 .inner
                 .write_all(writer.buffer.ciphertext().map_err(encryption_error)?)?;
-            writer.plaintext_length = 0;
             Ok(())
         })
     }
@@ -254,20 +248,14 @@ impl<W: Write> Write for EncryptWriter<W> {
             StreamStatus::Failed => return Err(poisoned_error()),
         }
 
-        let capacity = self.parameters().plaintext_segment_length();
-        if self.plaintext_length == capacity {
-            self.emit_non_final()?;
+        let copied = self.buffer.extend_plaintext(input);
+        if copied > 0 {
+            return Ok(copied);
         }
 
-        let written = input.len().min(capacity - self.plaintext_length);
-        let start = self.plaintext_length;
-        let plaintext = self
-            .buffer
-            .prepare_plaintext(capacity)
-            .map_err(encryption_error)?;
-        plaintext[start..start + written].copy_from_slice(&input[..written]);
-        self.plaintext_length += written;
-        Ok(written)
+        // The buffer holds one full segment: emit it and start the next.
+        self.emit_non_final()?;
+        Ok(self.buffer.extend_plaintext(input))
     }
 
     /// Flushes the wrapped writer, kinda.
@@ -406,7 +394,7 @@ impl<R: Read> EncryptReader<R> {
         };
 
         self.buffer
-            .prepare_plaintext(plaintext_length)
+            .truncate_plaintext(plaintext_length)
             .map_err(encryption_error)?;
         self.ciphertext_position = 0;
         self.ciphertext_length = if is_final {
