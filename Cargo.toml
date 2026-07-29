@@ -1,6 +1,6 @@
 [package]
 name = "fast-floe"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 rust-version = "1.87"
 license = "Apache-2.0"
@@ -44,10 +44,7 @@ harness = false
 name = "io_adapters"
 harness = false
 
-# codegen-units = 1 removes thin-LTO partitioning luck from measurements:
-# the pure-Rust provider's AES-GCM core is monomorphized into this crate,
-# and which codegen unit it lands in otherwise swings its throughput ~30%
-# between builds of identical source.
+# codegen-units = 1 necessary for RustCrypto aes-gcm otherwise swings its throughput ~30%
 [profile.bench]
 lto = "thin"
 codegen-units = 1

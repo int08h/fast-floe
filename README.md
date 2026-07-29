@@ -360,17 +360,15 @@ Run all provider and segment-size benchmarks with:
 ### Benchmark results
 
 Median throughput in GiB/s with each provider compiled solo with `-C target-cpu=native` and a
-single codegen unit (the bench profile pins `codegen-units = 1` so codegen-unit partitioning
-does not add build-to-build noise). Each benchmark trial sizes its buffer to be at least 4x the
+single codegen unit. Each benchmark sizes its buffer to be at least 4x the
 detected last-level-cache size to ensure we're reaching actual memory, not spinning in cache.
 
-The "into" columns encrypt or decrypt into a separate output buffer in one pass
-(using scatter/gather when the provider supports it) while "in place" overwrite
-their input, processing segments within one contiguous arena.
+The "into" columns encrypt or decrypt into a separate output buffer (using scatter/gather 
+when the provider supports it) while "in place" overwrite their input. 
 
 #### AMD Zen 5 9950X (VAES, AVX-512), Rust 1.97.1
 
-FLOE performance in GiB/sec, higher is better
+FLOE segment-oriented performance in GiB/sec, higher is better
 
 | Provider     | Segments | Encrypt into | Encrypt in place | Decrypt into | Decrypt in place |
 |--------------|----------|-------------:|-----------------:|-------------:|-----------------:|
@@ -383,15 +381,13 @@ FLOE performance in GiB/sec, higher is better
 | `ring`       | 4 KiB    |         5.99 |             9.15 |         6.91 |            10.31 |
 | `rustcrypto` | 4 KiB    |         4.67 |             4.84 |         4.81 |             4.59 |
 
-Compared to "bare" AES-256-GCM from each provider, FLOE in-place on Zen5 is within ~5% on
+Compared to "bare" AES-256-GCM from each provider, FLOE "in_place" on Zen5 is within ~5% on
 1 MiB segments for `aws-lc-rs`, `ring`, and `rustcrypto` (`boring` is ~12% slower), and
-roughly 5%-45% slower on 4 KiB segments depending on the provider's per-call fixed costs.
+roughly 5%-45% slower on 4 KiB segments.
 
-The `std::io` adapters and the random-access reader add stream framing, buffering, and (for
-the random-access reader) per-segment positioning on top of the segment operations above.
-These figures stream 128 MiB messages; the reader columns use whole-segment read buffers,
-which take the copy-free direct path. Sub-segment reads fall back to an internal buffer plus
-one copy. Run them with `cargo bench --bench io_adapters`.
+The `std::io` adapters and the random-access reader have additional overhead on top of the segment 
+operations above. The `Reader`'s operate on whole-segments which are copy-free. Sub-segment 
+sized reads are buffered (one copy). 
 
 | Provider     | Segments | EncryptWriter | EncryptReader | DecryptReader | Reader (seq) | Reader (range) |
 |--------------|----------|--------------:|--------------:|--------------:|-------------:|---------------:|
@@ -406,9 +402,7 @@ one copy. Run them with `cargo bench --bench io_adapters`.
 
 #### Apple M3, Rust 1.97.1
 
-FLOE performance in GiB/sec, higher is better. These results predate the pinned
-single-codegen-unit bench profile and the adapter benchmarks; they will be refreshed
-in a future pass on that hardware.
+FLOE segment-oriented performance in GiB/sec, higher is better. 
 
 | Provider     | Segments | Encrypt into | Encrypt in place | Decrypt into | Decrypt in place |
 |--------------|----------|-------------:|-----------------:|-------------:|-----------------:|
