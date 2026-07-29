@@ -44,8 +44,13 @@ harness = false
 name = "io_adapters"
 harness = false
 
+# codegen-units = 1 removes thin-LTO partitioning luck from measurements:
+# the pure-Rust provider's AES-GCM core is monomorphized into this crate,
+# and which codegen unit it lands in otherwise swings its throughput ~30%
+# between builds of identical source.
 [profile.bench]
 lto = "thin"
+codegen-units = 1
 
 [lints.rust]
 unsafe_code = "forbid"
