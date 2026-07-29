@@ -14,7 +14,7 @@ use std::io::{self, Read, Write};
 
 use crate::online::{Decryptor, Encryptor};
 use crate::wire::{decryption_error, encryption_error, read_fully, read_header};
-use crate::{Error, Header, Key, LengthRequirement, Parameters, SegmentBuffer};
+use crate::{Error, Header, Key, LengthRequirement, Parameters, SegmentBuffer, SegmentFraming};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StreamStatus {
@@ -49,6 +49,13 @@ impl<W> FinishError<W> {
     #[must_use]
     pub fn into_parts(self) -> (io::Error, W) {
         (self.error, self.inner)
+    }
+
+    fn wrap(result: io::Result<()>, inner: W) -> Result<W, FinishError<W>> {
+        match result {
+            Ok(()) => Ok(inner),
+            Err(error) => Err(Self { inner, error }),
+        }
     }
 }
 
@@ -90,7 +97,6 @@ pub struct EncryptWriter<W> {
     inner: W,
     encryptor: Option<Encryptor>,
     header: Header,
-    parameters: Parameters,
     buffer: SegmentBuffer,
     plaintext_length: usize,
     status: StreamStatus,
@@ -111,7 +117,6 @@ impl<W: Write> EncryptWriter<W> {
             inner,
             encryptor: Some(encryptor),
             header,
-            parameters,
             buffer: SegmentBuffer::new(parameters),
             plaintext_length: 0,
             status: StreamStatus::Open,
@@ -127,7 +132,7 @@ impl<W: Write> EncryptWriter<W> {
     /// Returns this writer's parameter set.
     #[must_use]
     pub const fn parameters(&self) -> Parameters {
-        self.parameters
+        self.buffer.parameters()
     }
 
     /// Returns a shared reference to the wrapped writer.
@@ -164,28 +169,7 @@ impl<W: Write> EncryptWriter<W> {
             StreamStatus::Failed => return Err(poisoned_error()),
             StreamStatus::Open => {}
         }
-
-        let encryptor = self.encryptor.take().ok_or_else(poisoned_error)?;
-        self.buffer
-            .prepare_plaintext(self.plaintext_length)
-            .map_err(encryption_error)?;
-        if let Err(error) = encryptor.encrypt_final_segment_in_place(&mut self.buffer) {
-            self.status = StreamStatus::Failed;
-            return Err(encryption_error(error.into_error()));
-        }
-
-        let ciphertext = self.buffer.ciphertext().map_err(encryption_error)?;
-        if let Err(error) = self.inner.write_all(ciphertext) {
-            self.status = StreamStatus::Failed;
-            return Err(error);
-        }
-        self.plaintext_length = 0;
-        if let Err(error) = self.inner.flush() {
-            self.status = StreamStatus::Failed;
-            return Err(error);
-        }
-        self.status = StreamStatus::Finished;
-        Ok(())
+        self.poison_on_error(Self::finish_message)
     }
 
     /// Finalizes the FLOE message and returns the wrapped writer.
@@ -194,13 +178,8 @@ impl<W: Write> EncryptWriter<W> {
     ///
     /// Returns an error if [`Self::try_finish`] fails.
     pub fn finish(mut self) -> Result<W, FinishError<W>> {
-        match self.try_finish() {
-            Ok(()) => Ok(self.inner),
-            Err(error) => Err(FinishError {
-                inner: self.inner,
-                error,
-            }),
-        }
+        let result = self.try_finish();
+        FinishError::wrap(result, self.inner)
     }
 
     /// Consumes this writer and extracts the wrapped writer without
@@ -212,26 +191,50 @@ impl<W: Write> EncryptWriter<W> {
         self.inner
     }
 
-    fn emit_non_final(&mut self) -> io::Result<()> {
+    /// Runs `op` and poisons this writer when it fails, honoring the
+    /// documented contract that any error leaves the writer unusable.
+    fn poison_on_error(&mut self, op: impl FnOnce(&mut Self) -> io::Result<()>) -> io::Result<()> {
+        let result = op(self);
+        if result.is_err() {
+            self.status = StreamStatus::Failed;
+        }
+        result
+    }
+
+    fn finish_message(&mut self) -> io::Result<()> {
+        let encryptor = self.encryptor.take().ok_or_else(poisoned_error)?;
         self.buffer
             .prepare_plaintext(self.plaintext_length)
             .map_err(encryption_error)?;
-        if let Err(error) = self
-            .encryptor
-            .as_mut()
-            .ok_or_else(poisoned_error)?
-            .encrypt_non_final_segment_in_place(&mut self.buffer)
-        {
-            self.status = StreamStatus::Failed;
-            return Err(encryption_error(error));
-        }
-        let ciphertext = self.buffer.ciphertext().map_err(encryption_error)?;
-        if let Err(error) = self.inner.write_all(ciphertext) {
-            self.status = StreamStatus::Failed;
-            return Err(error);
-        }
+        encryptor
+            .encrypt_final_segment_in_place(&mut self.buffer)
+            .map_err(|error| encryption_error(error.into_error()))?;
+        self.inner
+            .write_all(self.buffer.ciphertext().map_err(encryption_error)?)?;
         self.plaintext_length = 0;
+        self.inner.flush()?;
+        self.status = StreamStatus::Finished;
         Ok(())
+    }
+
+    fn emit_non_final(&mut self) -> io::Result<()> {
+        self.poison_on_error(|writer| {
+            writer
+                .buffer
+                .prepare_plaintext(writer.plaintext_length)
+                .map_err(encryption_error)?;
+            writer
+                .encryptor
+                .as_mut()
+                .ok_or_else(poisoned_error)?
+                .encrypt_non_final_segment_in_place(&mut writer.buffer)
+                .map_err(encryption_error)?;
+            writer
+                .inner
+                .write_all(writer.buffer.ciphertext().map_err(encryption_error)?)?;
+            writer.plaintext_length = 0;
+            Ok(())
+        })
     }
 }
 
@@ -251,7 +254,7 @@ impl<W: Write> Write for EncryptWriter<W> {
             StreamStatus::Failed => return Err(poisoned_error()),
         }
 
-        let capacity = self.parameters.plaintext_segment_length();
+        let capacity = self.parameters().plaintext_segment_length();
         if self.plaintext_length == capacity {
             self.emit_non_final()?;
         }
@@ -297,7 +300,6 @@ pub struct EncryptReader<R> {
     inner: R,
     encryptor: Option<Encryptor>,
     header: Header,
-    parameters: Parameters,
     header_position: usize,
     buffer: SegmentBuffer,
     ciphertext_position: usize,
@@ -320,7 +322,6 @@ impl<R: Read> EncryptReader<R> {
             inner,
             encryptor: Some(encryptor),
             header,
-            parameters,
             header_position: 0,
             buffer: SegmentBuffer::new(parameters),
             ciphertext_position: 0,
@@ -339,7 +340,7 @@ impl<R: Read> EncryptReader<R> {
     /// Returns this reader's parameter set.
     #[must_use]
     pub const fn parameters(&self) -> Parameters {
-        self.parameters
+        self.buffer.parameters()
     }
 
     /// Returns a shared reference to the wrapped plaintext reader.
@@ -378,7 +379,7 @@ impl<R: Read> EncryptReader<R> {
     }
 
     fn try_load_segment(&mut self) -> io::Result<()> {
-        let capacity = self.parameters.plaintext_segment_length();
+        let capacity = self.parameters().plaintext_segment_length();
         let plaintext = self
             .buffer
             .prepare_plaintext(capacity)
@@ -479,7 +480,6 @@ pub struct DecryptReader<R> {
     inner: R,
     decryptor: Option<Decryptor>,
     header: Header,
-    parameters: Parameters,
     buffer: SegmentBuffer,
     plaintext_consumed: usize,
     plaintext_available: usize,
@@ -501,7 +501,6 @@ impl<R: Read> DecryptReader<R> {
             inner,
             decryptor: Some(decryptor),
             header,
-            parameters,
             buffer: SegmentBuffer::new(parameters),
             plaintext_consumed: 0,
             plaintext_available: 0,
@@ -518,7 +517,7 @@ impl<R: Read> DecryptReader<R> {
     /// Returns the authenticated parameter set.
     #[must_use]
     pub const fn parameters(&self) -> Parameters {
-        self.parameters
+        self.buffer.parameters()
     }
 
     /// Returns a shared reference to the wrapped reader.
@@ -596,13 +595,8 @@ impl<R: Read> DecryptReader<R> {
     /// Returns an error preserving the wrapped reader for invalid unread
     /// ciphertext or any byte after the authenticated final segment.
     pub fn finish(mut self) -> Result<R, FinishError<R>> {
-        match self.try_finish() {
-            Ok(()) => Ok(self.inner),
-            Err(error) => Err(FinishError {
-                inner: self.inner,
-                error,
-            }),
-        }
+        let result = self.try_finish();
+        FinishError::wrap(result, self.inner)
     }
 
     /// Authenticates one framed message and returns the wrapped reader
@@ -614,13 +608,8 @@ impl<R: Read> DecryptReader<R> {
     /// A recovered reader is unchecked and may be positioned after partially
     /// consumed invalid input.
     pub fn finish_frame(mut self) -> Result<R, FinishError<R>> {
-        match self.try_finish_frame() {
-            Ok(()) => Ok(self.inner),
-            Err(error) => Err(FinishError {
-                inner: self.inner,
-                error,
-            }),
-        }
+        let result = self.try_finish_frame();
+        FinishError::wrap(result, self.inner)
     }
 
     /// Extracts the reader without authenticating unread ciphertext.
@@ -660,7 +649,7 @@ impl<R: Read> DecryptReader<R> {
         }
 
         let framing =
-            crate::SegmentFraming::decode(self.parameters, prefix).map_err(decryption_error)?;
+            SegmentFraming::decode(self.parameters(), prefix).map_err(decryption_error)?;
         let ciphertext_length = framing.ciphertext_length();
         let ciphertext = self
             .buffer

@@ -411,6 +411,31 @@ mod aead_ring {
             Ok(())
         }
 
+        /// Encrypts `plaintext` into `output` (`ciphertext || tag`). ring has
+        /// no one-pass scatter API, so this copies the plaintext into `output`
+        /// and seals in place.
+        #[inline]
+        pub(crate) fn seal_into(
+            &self,
+            nonce: &[u8; 12],
+            aad: &[u8],
+            plaintext: &[u8],
+            output: &mut [u8],
+        ) -> Result<()> {
+            let (ciphertext, tag_out) = output.split_at_mut(plaintext.len());
+            ciphertext.copy_from_slice(plaintext);
+            let generated_tag = self
+                .0
+                .seal_in_place_separate_tag(
+                    Nonce::assume_unique_for_key(*nonce),
+                    Aad::from(aad),
+                    ciphertext,
+                )
+                .map_err(|_| Error::CryptoFailure)?;
+            tag_out.copy_from_slice(generated_tag.as_ref());
+            Ok(())
+        }
+
         #[inline]
         pub(crate) fn open(
             &self,
@@ -531,22 +556,15 @@ impl AeadKey {
         if output.len() != expected {
             return Err(crate::Error::CryptoFailure);
         }
-        #[allow(unreachable_patterns, clippy::match_wildcard_for_single_variants)]
         match self {
             #[cfg(feature = "aws-lc-rs")]
             Self::AwsLcRs(key) => key.seal_into(nonce, aad, plaintext, output),
             #[cfg(feature = "boring")]
             Self::Boring(key) => key.seal_into(nonce, aad, plaintext, output),
+            #[cfg(feature = "ring")]
+            Self::Ring(key) => key.seal_into(nonce, aad, plaintext, output),
             #[cfg(feature = "rustcrypto")]
             Self::RustCrypto(key) => key.seal_into(nonce, aad, plaintext, output),
-            _ => {
-                let (ciphertext, tag_out) = output.split_at_mut(plaintext.len());
-                ciphertext.copy_from_slice(plaintext);
-                let mut tag = [0u8; crate::AEAD_TAG_LENGTH];
-                self.seal(nonce, aad, ciphertext, &mut tag)?;
-                tag_out.copy_from_slice(&tag);
-                Ok(())
-            }
         }
     }
 

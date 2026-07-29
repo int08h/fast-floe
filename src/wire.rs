@@ -3,12 +3,12 @@ use std::io::{self, Read};
 use crate::{Error, Header, LengthRequirement, Result};
 
 pub(crate) fn split_header(ciphertext: &[u8]) -> Result<(Header, &[u8])> {
-    if ciphertext.len() < Header::LEN {
-        return Err(Error::InvalidHeaderLength {
-            actual: ciphertext.len(),
-        });
-    }
-    let (header, body) = ciphertext.split_at(Header::LEN);
+    let (header, body) =
+        ciphertext
+            .split_at_checked(Header::LEN)
+            .ok_or(Error::InvalidHeaderLength {
+                actual: ciphertext.len(),
+            })?;
     Ok((Header::try_from(header)?, body))
 }
 
@@ -58,4 +58,11 @@ pub(crate) fn decryption_error(error: Error) -> io::Error {
 
 pub(crate) fn length_overflow() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, Error::LengthOverflow)
+}
+
+pub(crate) fn output_too_small(actual: usize, required: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        Error::OutputTooSmall { actual, required },
+    )
 }

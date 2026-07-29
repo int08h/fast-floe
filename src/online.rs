@@ -181,6 +181,31 @@ impl Encryptor {
         self.counter.next_position()
     }
 
+    /// Runs one non-final segment operation at the reserved position and
+    /// advances the counter only on success.
+    fn advance<T>(&mut self, op: impl FnOnce(&mut EncryptionState, u64) -> Result<T>) -> Result<T> {
+        let position = self.counter.position_for(SegmentKind::NonFinal)?;
+        let value = op(&mut self.state, position)?;
+        self.counter.complete(SegmentKind::NonFinal);
+        Ok(value)
+    }
+
+    /// Runs the final segment operation, consuming this encryptor on success
+    /// and preserving it in the returned [`FinalEncryptError`] on failure.
+    fn finalize<T>(
+        mut self,
+        op: impl FnOnce(&mut EncryptionState, u64) -> Result<T>,
+    ) -> core::result::Result<T, FinalEncryptError> {
+        let result = self
+            .counter
+            .position_for(SegmentKind::Final)
+            .and_then(|position| op(&mut self.state, position));
+        result.map_err(|error| FinalEncryptError {
+            encryptor: Box::new(self),
+            error,
+        })
+    }
+
     /// Encrypts one full, non-final plaintext segment.
     ///
     /// # Errors
@@ -188,12 +213,9 @@ impl Encryptor {
     /// Returns an error if the segment limit is reached, the plaintext does not
     /// have the exact full-segment length, or encryption fails.
     pub fn encrypt_non_final_segment(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let position = self.counter.position_for(SegmentKind::NonFinal)?;
-        let encrypted =
-            self.state
-                .encrypt_segment_at(plaintext, position, SegmentKind::NonFinal)?;
-        self.counter.complete(SegmentKind::NonFinal);
-        Ok(encrypted)
+        self.advance(|state, position| {
+            state.encrypt_segment_at(plaintext, position, SegmentKind::NonFinal)
+        })
     }
 
     /// Encrypts one full, non-final segment into `output`.
@@ -207,15 +229,9 @@ impl Encryptor {
         plaintext: &[u8],
         output: &mut [u8],
     ) -> Result<usize> {
-        let position = self.counter.position_for(SegmentKind::NonFinal)?;
-        let written = self.state.encrypt_segment_into_at(
-            plaintext,
-            position,
-            SegmentKind::NonFinal,
-            output,
-        )?;
-        self.counter.complete(SegmentKind::NonFinal);
-        Ok(written)
+        self.advance(|state, position| {
+            state.encrypt_segment_into_at(plaintext, position, SegmentKind::NonFinal, output)
+        })
     }
 
     /// Encrypts one full, non-final payload prepared in `buffer`.
@@ -228,12 +244,9 @@ impl Encryptor {
         &mut self,
         buffer: &'a mut SegmentBuffer,
     ) -> Result<&'a [u8]> {
-        let position = self.counter.position_for(SegmentKind::NonFinal)?;
-        let encrypted =
-            self.state
-                .encrypt_segment_in_place_at(buffer, position, SegmentKind::NonFinal)?;
-        self.counter.complete(SegmentKind::NonFinal);
-        Ok(encrypted)
+        self.advance(|state, position| {
+            state.encrypt_segment_in_place_at(buffer, position, SegmentKind::NonFinal)
+        })
     }
 
     /// Encrypts the final plaintext segment and consumes this encryptor.
@@ -244,23 +257,12 @@ impl Encryptor {
     /// is exhausted, or encryption fails. The returned
     /// [`FinalEncryptError`] preserves this encryptor for correction or retry.
     pub fn encrypt_final_segment(
-        mut self,
+        self,
         plaintext: &[u8],
     ) -> core::result::Result<Vec<u8>, FinalEncryptError> {
-        let result = self
-            .counter
-            .position_for(SegmentKind::Final)
-            .and_then(|position| {
-                self.state
-                    .encrypt_segment_at(plaintext, position, SegmentKind::Final)
-            });
-        match result {
-            Ok(encrypted) => Ok(encrypted),
-            Err(error) => Err(FinalEncryptError {
-                encryptor: Box::new(self),
-                error,
-            }),
-        }
+        self.finalize(|state, position| {
+            state.encrypt_segment_at(plaintext, position, SegmentKind::Final)
+        })
     }
 
     /// Encrypts the final plaintext segment into `output` and consumes this
@@ -272,24 +274,13 @@ impl Encryptor {
     /// [`Error::OutputTooSmall`] when necessary. The returned
     /// [`FinalEncryptError`] preserves this encryptor.
     pub fn encrypt_final_segment_into(
-        mut self,
+        self,
         plaintext: &[u8],
         output: &mut [u8],
     ) -> core::result::Result<usize, FinalEncryptError> {
-        let result = self
-            .counter
-            .position_for(SegmentKind::Final)
-            .and_then(|position| {
-                self.state
-                    .encrypt_segment_into_at(plaintext, position, SegmentKind::Final, output)
-            });
-        match result {
-            Ok(written) => Ok(written),
-            Err(error) => Err(FinalEncryptError {
-                encryptor: Box::new(self),
-                error,
-            }),
-        }
+        self.finalize(|state, position| {
+            state.encrypt_segment_into_at(plaintext, position, SegmentKind::Final, output)
+        })
     }
 
     /// Encrypts the final payload prepared in `buffer` and consumes this
@@ -301,23 +292,12 @@ impl Encryptor {
     /// payload, segment-limit exhaustion, or encryption failure. The returned
     /// [`FinalEncryptError`] preserves this encryptor.
     pub fn encrypt_final_segment_in_place(
-        mut self,
+        self,
         buffer: &mut SegmentBuffer,
     ) -> core::result::Result<&[u8], FinalEncryptError> {
-        let result = self
-            .counter
-            .position_for(SegmentKind::Final)
-            .and_then(|position| {
-                self.state
-                    .encrypt_segment_in_place_at(buffer, position, SegmentKind::Final)
-            });
-        match result {
-            Ok(encrypted) => Ok(encrypted),
-            Err(error) => Err(FinalEncryptError {
-                encryptor: Box::new(self),
-                error,
-            }),
-        }
+        self.finalize(|state, position| {
+            state.encrypt_segment_in_place_at(buffer, position, SegmentKind::Final)
+        })
     }
 }
 
@@ -390,6 +370,19 @@ impl Decryptor {
         self.counter.is_finished()
     }
 
+    /// Runs one segment operation at the reserved position and advances the
+    /// counter only on success.
+    fn advance<T>(
+        &mut self,
+        kind: SegmentKind,
+        op: impl FnOnce(&mut DecryptionState, u64) -> Result<T>,
+    ) -> Result<T> {
+        let position = self.counter.position_for(kind)?;
+        let value = op(&mut self.state, position)?;
+        self.counter.complete(kind);
+        Ok(value)
+    }
+
     /// Authenticates and decrypts the next segment.
     ///
     /// The final/non-final operation is selected from the segment prefix and
@@ -402,13 +395,9 @@ impl Decryptor {
     /// exhaustion, or authentication failure.
     pub fn decrypt_segment(&mut self, ciphertext_segment: &[u8]) -> Result<Vec<u8>> {
         let framing = self.framing(ciphertext_segment)?;
-        let kind = framing.kind();
-        let position = self.counter.position_for(kind)?;
-        let plaintext = self
-            .state
-            .decrypt_segment_at(ciphertext_segment, position, kind)?;
-        self.counter.complete(kind);
-        Ok(plaintext)
+        self.advance(framing.kind(), |state, position| {
+            state.decrypt_segment_at(ciphertext_segment, position, framing.kind())
+        })
     }
 
     /// Authenticates and decrypts the next segment into `output`.
@@ -432,16 +421,9 @@ impl Decryptor {
         framing: crate::SegmentFraming,
         output: &mut [u8],
     ) -> Result<usize> {
-        let kind = framing.kind();
-        let position = self.counter.position_for(kind)?;
-        let written = self.state.decrypt_segment_into_at_framed(
-            ciphertext_segment,
-            position,
-            framing,
-            output,
-        )?;
-        self.counter.complete(kind);
-        Ok(written)
+        self.advance(framing.kind(), |state, position| {
+            state.decrypt_segment_into_at_framed(ciphertext_segment, position, framing, output)
+        })
     }
 
     /// Authenticates and decrypts the encrypted segment prepared in `buffer`.
@@ -454,18 +436,10 @@ impl Decryptor {
         &mut self,
         buffer: &'a mut SegmentBuffer,
     ) -> Result<&'a mut [u8]> {
-        let prefix = {
-            let ciphertext = buffer.ciphertext()?;
-            segment_prefix(ciphertext, self.parameters())?
-        };
-        let framing = crate::SegmentFraming::decode(self.parameters(), prefix)?;
-        let kind = framing.kind();
-        let position = self.counter.position_for(kind)?;
-        let plaintext = self
-            .state
-            .decrypt_segment_in_place_at(buffer, position, kind)?;
-        self.counter.complete(kind);
-        Ok(plaintext)
+        let framing = self.framing(buffer.ciphertext()?)?;
+        self.advance(framing.kind(), |state, position| {
+            state.decrypt_segment_in_place_at(buffer, position, framing.kind())
+        })
     }
 
     /// Consumes this decryptor and verifies that a final segment was processed.

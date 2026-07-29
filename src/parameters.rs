@@ -51,6 +51,12 @@ pub(crate) const fn length_usize_to_u64(value: usize) -> u64 {
     value as u64
 }
 
+/// Clamps a message-arithmetic length into `usize` for error reporting.
+#[inline]
+pub(crate) fn length_u64_to_usize_saturating(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
 pub(crate) const HEADER_LENGTH_U64: u64 = length_usize_to_u64(HEADER_LENGTH);
 pub(crate) const SEGMENT_OVERHEAD_U64: u64 = length_usize_to_u64(SEGMENT_OVERHEAD);
 
@@ -199,6 +205,13 @@ impl MessageLayout {
             kind,
         })
     }
+
+    /// Returns the position of the segment containing `offset` in the
+    /// complete plaintext. Offsets at or beyond the plaintext length map to
+    /// positions outside this layout.
+    pub(crate) fn position_for_plaintext_offset(self, offset: u64) -> u64 {
+        offset / u64::from(self.parameters.plaintext_segment_length_u32())
+    }
 }
 
 impl IntoIterator for MessageLayout {
@@ -220,15 +233,21 @@ pub struct Segments {
     positions: Range<u64>,
 }
 
+impl Segments {
+    fn segment_at(&self, position: u64) -> SegmentLayout {
+        self.layout
+            .segment_for_position(position)
+            .expect("a layout iterator only produces valid segment positions")
+    }
+}
+
 impl Iterator for Segments {
     type Item = SegmentLayout;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let position = self.positions.next()?;
-        match self.layout.segment_for_position(position) {
-            Some(segment) => Some(segment),
-            None => unreachable!("a layout iterator only produces valid segment positions"),
-        }
+        self.positions
+            .next()
+            .map(|position| self.segment_at(position))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -238,11 +257,9 @@ impl Iterator for Segments {
 
 impl DoubleEndedIterator for Segments {
     fn next_back(&mut self) -> Option<Self::Item> {
-        let position = self.positions.next_back()?;
-        match self.layout.segment_for_position(position) {
-            Some(segment) => Some(segment),
-            None => unreachable!("a layout iterator only produces valid segment positions"),
-        }
+        self.positions
+            .next_back()
+            .map(|position| self.segment_at(position))
     }
 }
 
@@ -334,8 +351,11 @@ impl SegmentFraming {
     pub fn decode(parameters: Parameters, prefix: [u8; SEGMENT_PREFIX_LENGTH]) -> Result<Self> {
         let encoded = u32::from_be_bytes(prefix);
 
-        let ciphertext_length = if encoded == u32::MAX {
-            parameters.ciphertext_segment_length()
+        let (ciphertext_length, kind) = if encoded == u32::MAX {
+            (
+                parameters.ciphertext_segment_length(),
+                SegmentKind::NonFinal,
+            )
         } else {
             // Validated in u32 space: the range check must not depend on the
             // width of usize, because `encoded` is attacker-controlled and
@@ -350,17 +370,13 @@ impl SegmentFraming {
                     },
                 });
             }
-            length_u32_to_usize(encoded)
+            (length_u32_to_usize(encoded), SegmentKind::Final)
         };
 
         Ok(Self {
             ciphertext_length,
             plaintext_length: ciphertext_length - SEGMENT_OVERHEAD,
-            kind: if encoded == u32::MAX {
-                SegmentKind::NonFinal
-            } else {
-                SegmentKind::Final
-            },
+            kind,
         })
     }
 
@@ -476,6 +492,24 @@ impl Parameters {
         self.ciphertext_segment_length - SEGMENT_OVERHEAD_U32
     }
 
+    /// Checks that `actual` can be the length of a ciphertext segment under
+    /// this parameter set: at least the framing overhead and at most one full
+    /// segment.
+    pub(crate) fn validate_ciphertext_segment_length(self, actual: usize) -> Result<()> {
+        let maximum = self.ciphertext_segment_length();
+        if (SEGMENT_OVERHEAD..=maximum).contains(&actual) {
+            Ok(())
+        } else {
+            Err(Error::InvalidCiphertextLength {
+                actual,
+                required: LengthRequirement::Between {
+                    minimum: SEGMENT_OVERHEAD,
+                    maximum,
+                },
+            })
+        }
+    }
+
     /// Calculates the complete FLOE layout for `plaintext_length`.
     ///
     /// # Errors
@@ -486,11 +520,8 @@ impl Parameters {
     pub fn plaintext_layout(self, plaintext_length: u64) -> Result<MessageLayout> {
         let plaintext_segment_length = u64::from(self.plaintext_segment_length_u32());
 
-        let segment_count = if plaintext_length == 0 {
-            1
-        } else {
-            (plaintext_length - 1) / plaintext_segment_length + 1
-        };
+        // An empty message still occupies one (final) segment.
+        let segment_count = plaintext_length.div_ceil(plaintext_segment_length).max(1);
 
         if segment_count > AEAD_MAX_SEGMENTS {
             return Err(Error::SegmentLimit);
@@ -529,7 +560,7 @@ impl Parameters {
         let body_length = ciphertext_length
             .checked_sub(HEADER_LENGTH_U64)
             .ok_or_else(|| Error::InvalidHeaderLength {
-                actual: usize::try_from(ciphertext_length).unwrap_or(usize::MAX),
+                actual: length_u64_to_usize_saturating(ciphertext_length),
             })?;
 
         if body_length == 0 {
@@ -538,7 +569,7 @@ impl Parameters {
 
         let ciphertext_segment_length = u64::from(self.ciphertext_segment_length_u32());
 
-        let segment_count = (body_length - 1) / ciphertext_segment_length + 1;
+        let segment_count = body_length.div_ceil(ciphertext_segment_length);
 
         if segment_count > AEAD_MAX_SEGMENTS {
             return Err(Error::SegmentLimit);
@@ -549,7 +580,7 @@ impl Parameters {
 
         if final_length < SEGMENT_OVERHEAD_U64 {
             return Err(Error::InvalidCiphertextLength {
-                actual: usize::try_from(final_length).unwrap_or(usize::MAX),
+                actual: length_u64_to_usize_saturating(final_length),
                 required: LengthRequirement::Between {
                     minimum: SEGMENT_OVERHEAD,
                     maximum: self.ciphertext_segment_length(),

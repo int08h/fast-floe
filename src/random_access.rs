@@ -10,10 +10,12 @@ use core::ops::{Bound, Range, RangeBounds};
 use std::io::{self, Read, Seek, SeekFrom};
 
 pub use crate::parameters::{MessageLayout, SegmentLayout, Segments};
-use crate::wire::{decryption_error, length_overflow, read_exact_segment, read_header};
+use crate::wire::{
+    decryption_error, length_overflow, output_too_small, read_exact_segment, read_header,
+};
 use crate::{
     DecryptionState, Error, HEADER_LENGTH_U64, Header, Key, Parameters, SegmentBuffer,
-    length_usize_to_u64, start_decryption_inferred,
+    length_u64_to_usize_saturating, length_usize_to_u64, start_decryption_inferred,
 };
 
 /// Authenticated random-access reader for a complete seekable FLOE ciphertext.
@@ -157,13 +159,7 @@ impl<R: Read + Seek> Reader<R> {
         let segment = self.segment(position)?;
         let required = segment.plaintext_length();
         if output.len() < required {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                Error::OutputTooSmall {
-                    actual: output.len(),
-                    required,
-                },
-            ));
+            return Err(output_too_small(output.len(), required));
         }
         self.decrypt_segment_direct(segment, &mut output[..required])?;
         Ok(required)
@@ -203,13 +199,7 @@ impl<R: Read + Seek> Reader<R> {
         let range = resolve_bounds(&range, self.plaintext_length())?;
         let required = usize::try_from(range.end - range.start).map_err(|_| length_overflow())?;
         if output.len() < required {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                Error::OutputTooSmall {
-                    actual: output.len(),
-                    required,
-                },
-            ));
+            return Err(output_too_small(output.len(), required));
         }
         self.read_resolved_range_into(range, output)
     }
@@ -223,9 +213,8 @@ impl<R: Read + Seek> Reader<R> {
             return Ok(0);
         }
 
-        let segment_length = u64::from(self.parameters().plaintext_segment_length_u32());
-        let first = range.start / segment_length;
-        let last = (range.end - 1) / segment_length;
+        let first = self.layout.position_for_plaintext_offset(range.start);
+        let last = self.layout.position_for_plaintext_offset(range.end - 1);
         let mut written = 0;
 
         for position in first..=last {
@@ -310,7 +299,9 @@ impl<R: Read + Seek> Reader<R> {
         self.load_segment(segment)
     }
 
-    fn load_segment(&mut self, segment: SegmentLayout) -> io::Result<()> {
+    /// Invalidates the plaintext cache, then seeks to `segment` and reads its
+    /// complete ciphertext into the scratch buffer.
+    fn fetch_segment_ciphertext(&mut self, segment: SegmentLayout) -> io::Result<()> {
         self.cached_position = None;
         self.seek_to_segment(segment)?;
 
@@ -319,7 +310,11 @@ impl<R: Read + Seek> Reader<R> {
             .prepare_ciphertext(segment.ciphertext_length())
             .map_err(decryption_error)?;
 
-        read_exact_segment(&mut self.inner, ciphertext)?;
+        read_exact_segment(&mut self.inner, ciphertext)
+    }
+
+    fn load_segment(&mut self, segment: SegmentLayout) -> io::Result<()> {
+        self.fetch_segment_ciphertext(segment)?;
 
         self.state
             .decrypt_segment_in_place(&mut self.scratch, segment)
@@ -335,15 +330,7 @@ impl<R: Read + Seek> Reader<R> {
         segment: SegmentLayout,
         output: &mut [u8],
     ) -> io::Result<()> {
-        self.cached_position = None;
-        self.seek_to_segment(segment)?;
-
-        let ciphertext = self
-            .scratch
-            .prepare_ciphertext(segment.ciphertext_length())
-            .map_err(decryption_error)?;
-
-        read_exact_segment(&mut self.inner, ciphertext)?;
+        self.fetch_segment_ciphertext(segment)?;
 
         let ciphertext = self.scratch.ciphertext().map_err(decryption_error)?;
         self.state
@@ -378,8 +365,9 @@ impl<R: Read + Seek> Read for Reader<R> {
             return Ok(0);
         }
 
-        let segment_length = u64::from(self.parameters().plaintext_segment_length_u32());
-        let position = self.plaintext_position / segment_length;
+        let position = self
+            .layout
+            .position_for_plaintext_offset(self.plaintext_position);
         let segment = self.segment(position)?;
         self.load_cached_segment(segment)?;
 
@@ -459,7 +447,7 @@ fn remaining_length(reader: &mut (impl Read + Seek), message_start: u64) -> io::
 fn validate_header_bound(ciphertext_length: u64) -> io::Result<()> {
     if ciphertext_length < HEADER_LENGTH_U64 {
         Err(decryption_error(Error::InvalidHeaderLength {
-            actual: usize::try_from(ciphertext_length).unwrap_or(usize::MAX),
+            actual: length_u64_to_usize_saturating(ciphertext_length),
         }))
     } else {
         Ok(())

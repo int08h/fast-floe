@@ -38,6 +38,9 @@ impl Header {
     /// Length of every FLOE header in bytes.
     pub const LEN: usize = HEADER_LENGTH;
 
+    const FLOE_IV_OFFSET: usize = ENCODED_PARAMETERS_LENGTH;
+    const TAG_OFFSET: usize = Self::FLOE_IV_OFFSET + FLOE_IV_LENGTH;
+
     /// Returns the complete header bytes.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; HEADER_LENGTH] {
@@ -55,9 +58,37 @@ impl Header {
     /// Returns [`Error::InvalidHeaderParameters`] if the encoded parameter set
     /// is not supported.
     pub fn unverified_parameters(&self) -> Result<Parameters> {
-        let mut encoded = [0u8; ENCODED_PARAMETERS_LENGTH];
-        encoded.copy_from_slice(&self.0[..ENCODED_PARAMETERS_LENGTH]);
-        Parameters::decode(encoded)
+        Parameters::decode(*self.encoded_parameters())
+    }
+
+    fn from_fields(
+        encoded: &[u8; ENCODED_PARAMETERS_LENGTH],
+        floe_iv: &[u8; FLOE_IV_LENGTH],
+        tag: &[u8; HEADER_TAG_LENGTH],
+    ) -> Self {
+        let mut bytes = [0u8; HEADER_LENGTH];
+        bytes[..Self::FLOE_IV_OFFSET].copy_from_slice(encoded);
+        bytes[Self::FLOE_IV_OFFSET..Self::TAG_OFFSET].copy_from_slice(floe_iv);
+        bytes[Self::TAG_OFFSET..].copy_from_slice(tag);
+        Self(bytes)
+    }
+
+    fn encoded_parameters(&self) -> &[u8; ENCODED_PARAMETERS_LENGTH] {
+        self.0[..Self::FLOE_IV_OFFSET]
+            .try_into()
+            .expect("header field offsets are compile-time constants")
+    }
+
+    fn floe_iv(&self) -> &[u8; FLOE_IV_LENGTH] {
+        self.0[Self::FLOE_IV_OFFSET..Self::TAG_OFFSET]
+            .try_into()
+            .expect("header field offsets are compile-time constants")
+    }
+
+    fn tag(&self) -> &[u8; HEADER_TAG_LENGTH] {
+        self.0[Self::TAG_OFFSET..]
+            .try_into()
+            .expect("header field offsets are compile-time constants")
     }
 }
 
@@ -108,6 +139,22 @@ impl<const N: usize> Drop for SecretBytes<N> {
 struct CachedKey {
     masked_position: u64,
     key: AeadKey,
+}
+
+impl CachedKey {
+    fn derive(context: &MessageContext, masked_position: u64) -> Result<Self> {
+        Ok(Self {
+            masked_position,
+            key: derive_segment_key(
+                context.provider,
+                context.parameters,
+                &context.message_key,
+                &context.floe_iv,
+                &context.aad,
+                masked_position,
+            )?,
+        })
+    }
 }
 
 struct MessageContext {
@@ -170,17 +217,7 @@ impl KeyCache {
     #[inline]
     fn new(context: &MessageContext) -> Result<Self> {
         Ok(Self {
-            cached_key: Some(CachedKey {
-                masked_position: 0,
-                key: derive_segment_key(
-                    context.provider,
-                    context.parameters,
-                    &context.message_key,
-                    &context.floe_iv,
-                    &context.aad,
-                    0,
-                )?,
-            }),
+            cached_key: Some(CachedKey::derive(context, 0)?),
         })
     }
 
@@ -201,22 +238,13 @@ impl KeyCache {
             .as_ref()
             .is_none_or(|cached| cached.masked_position != masked_position)
         {
-            self.cached_key = Some(CachedKey {
-                masked_position,
-                key: derive_segment_key(
-                    context.provider,
-                    context.parameters,
-                    &context.message_key,
-                    &context.floe_iv,
-                    &context.aad,
-                    masked_position,
-                )?,
-            });
+            self.cached_key = Some(CachedKey::derive(context, masked_position)?);
         }
-        self.cached_key
+        let cached = self
+            .cached_key
             .as_ref()
-            .map(|cached| &cached.key)
-            .ok_or(Error::CryptoFailure)
+            .expect("populated by the branch above");
+        Ok(&cached.key)
     }
 }
 
@@ -283,6 +311,36 @@ fn ciphertext_segment_size(
     }
 }
 
+/// Validates the segment lengths, writes the framing bytes into `output`, and
+/// resolves the segment key. Returns everything the caller's seal needs: the
+/// complete segment length, the fresh nonce, the key, and the segment AAD.
+#[inline]
+fn begin_segment_encryption<'a>(
+    context: &MessageContext,
+    keys: &'a mut KeyCache,
+    nonces: &mut NonceGenerator,
+    output: &mut [u8],
+    plaintext_length: usize,
+    position: u64,
+    kind: SegmentKind,
+) -> Result<(
+    usize,
+    [u8; AEAD_IV_LENGTH],
+    &'a AeadKey,
+    [u8; SEGMENT_AAD_LENGTH],
+)> {
+    let required = ciphertext_segment_size(context, plaintext_length, kind)?;
+    if output.len() < required {
+        return Err(Error::OutputTooSmall {
+            actual: output.len(),
+            required,
+        });
+    }
+    let nonce = write_segment_framing(nonces, output, kind, required)?;
+    let key = keys.key_for_position(context, position)?;
+    Ok((required, nonce, key, segment_aad(position, kind)))
+}
+
 #[inline]
 fn encrypt_segment_into_inner(
     context: &MessageContext,
@@ -293,16 +351,15 @@ fn encrypt_segment_into_inner(
     kind: SegmentKind,
     output: &mut [u8],
 ) -> Result<usize> {
-    let required = ciphertext_segment_size(context, plaintext.len(), kind)?;
-    if output.len() < required {
-        return Err(Error::OutputTooSmall {
-            actual: output.len(),
-            required,
-        });
-    }
-    let nonce = write_segment_framing(nonces, output, kind, required)?;
-    let key = keys.key_for_position(context, position)?;
-    let segment_aad = segment_aad(position, kind);
+    let (required, nonce, key, segment_aad) = begin_segment_encryption(
+        context,
+        keys,
+        nonces,
+        output,
+        plaintext.len(),
+        position,
+        kind,
+    )?;
     key.seal_into(
         &nonce,
         &segment_aad,
@@ -322,16 +379,15 @@ fn encrypt_segment_in_place_inner(
     position: u64,
     kind: SegmentKind,
 ) -> Result<usize> {
-    let required = ciphertext_segment_size(context, plaintext_length, kind)?;
-    if buffer.len() < required {
-        return Err(Error::OutputTooSmall {
-            actual: buffer.len(),
-            required,
-        });
-    }
-    let nonce = write_segment_framing(nonces, buffer, kind, required)?;
-    let key = keys.key_for_position(context, position)?;
-    let segment_aad = segment_aad(position, kind);
+    let (required, nonce, key, segment_aad) = begin_segment_encryption(
+        context,
+        keys,
+        nonces,
+        buffer,
+        plaintext_length,
+        position,
+        kind,
+    )?;
     let tag_start = SEGMENT_PAYLOAD_OFFSET + plaintext_length;
     let mut tag = [0u8; AEAD_TAG_LENGTH];
     key.seal(
@@ -371,14 +427,10 @@ fn validate_segment(
 ) -> Result<usize> {
     let maximum = context.parameters.ciphertext_segment_length();
     match kind {
-        SegmentKind::Final if !(SEGMENT_OVERHEAD..=maximum).contains(&ciphertext_segment.len()) => {
-            return Err(Error::InvalidCiphertextLength {
-                actual: ciphertext_segment.len(),
-                required: LengthRequirement::Between {
-                    minimum: SEGMENT_OVERHEAD,
-                    maximum,
-                },
-            });
+        SegmentKind::Final => {
+            context
+                .parameters
+                .validate_ciphertext_segment_length(ciphertext_segment.len())?;
         }
         SegmentKind::NonFinal if ciphertext_segment.len() != maximum => {
             return Err(Error::InvalidCiphertextLength {
@@ -386,7 +438,7 @@ fn validate_segment(
                 required: LengthRequirement::Exactly(maximum),
             });
         }
-        SegmentKind::Final | SegmentKind::NonFinal => {}
+        SegmentKind::NonFinal => {}
     }
 
     let prefix = u32::from_be_bytes(
@@ -433,11 +485,10 @@ fn decrypt_segment_into_inner(
     }
 
     let key = keys.key_for_position(context, position)?;
-    let nonce_start = SEGMENT_PREFIX_LENGTH;
-    let ciphertext_start = nonce_start + AEAD_IV_LENGTH;
     let tag_start = ciphertext_segment.len() - AEAD_TAG_LENGTH;
     let segment_aad = segment_aad(position, kind);
-    let nonce: &[u8; AEAD_IV_LENGTH] = ciphertext_segment[nonce_start..ciphertext_start]
+    let nonce: &[u8; AEAD_IV_LENGTH] = ciphertext_segment
+        [SEGMENT_PREFIX_LENGTH..SEGMENT_PAYLOAD_OFFSET]
         .try_into()
         .map_err(|_| Error::CryptoFailure)?;
     let tag: &[u8; AEAD_TAG_LENGTH] = ciphertext_segment[tag_start..]
@@ -447,7 +498,7 @@ fn decrypt_segment_into_inner(
     key.open(
         nonce,
         &segment_aad,
-        &ciphertext_segment[ciphertext_start..tag_start],
+        &ciphertext_segment[SEGMENT_PAYLOAD_OFFSET..tag_start],
         tag,
         &mut output[..plaintext_length],
     )?;
@@ -464,8 +515,7 @@ fn decrypt_segment_in_place_inner<'a>(
 ) -> Result<&'a mut [u8]> {
     let plaintext_length = validate_segment(context, ciphertext_segment, kind)?;
     let key = keys.key_for_position(context, position)?;
-    let ciphertext_start = SEGMENT_PAYLOAD_OFFSET;
-    let (framing, ciphertext_and_tag) = ciphertext_segment.split_at_mut(ciphertext_start);
+    let (framing, ciphertext_and_tag) = ciphertext_segment.split_at_mut(SEGMENT_PAYLOAD_OFFSET);
     let nonce: &[u8; AEAD_IV_LENGTH] = framing[SEGMENT_PREFIX_LENGTH..]
         .try_into()
         .map_err(|_| Error::CryptoFailure)?;
@@ -850,11 +900,8 @@ impl DecryptionState {
         match result {
             Ok(plaintext) => {
                 let length = plaintext.len();
-                buffer.mark_plaintext(SEGMENT_PAYLOAD_OFFSET, length);
-                buffer
-                    .raw_mut()
-                    .get_mut(SEGMENT_PAYLOAD_OFFSET..SEGMENT_PAYLOAD_OFFSET + length)
-                    .ok_or(Error::InvalidBufferState)
+                buffer.mark_plaintext(length);
+                buffer.plaintext_mut()
             }
             Err(error) => {
                 buffer.mark_empty();
@@ -1039,17 +1086,10 @@ pub fn start_encryption(
     rng.fill(&mut floe_iv)?;
 
     let encoded = parameters.encode();
-    let header_info: [&[u8]; 4] = [&encoded, &floe_iv, HEADER_TAG_PURPOSE, aad];
-    let mut header_tag = provider.kdf_expand::<HEADER_TAG_LENGTH>(key.as_bytes(), &header_info)?;
+    let mut header_tag = derive_header_tag(provider, key, &encoded, &floe_iv, aad)?;
+    let message_key = derive_message_key(provider, key, &encoded, &floe_iv, aad)?;
 
-    let message_info: [&[u8]; 4] = [&encoded, &floe_iv, MESSAGE_KEY_PURPOSE, aad];
-    let message_key = SecretBytes(provider.kdf_expand::<48>(key.as_bytes(), &message_info)?);
-
-    let mut header = [0u8; HEADER_LENGTH];
-    header[..ENCODED_PARAMETERS_LENGTH].copy_from_slice(&encoded);
-    header[ENCODED_PARAMETERS_LENGTH..ENCODED_PARAMETERS_LENGTH + FLOE_IV_LENGTH]
-        .copy_from_slice(&floe_iv);
-    header[ENCODED_PARAMETERS_LENGTH + FLOE_IV_LENGTH..].copy_from_slice(&header_tag);
+    let header = Header::from_fields(&encoded, &floe_iv, &header_tag);
     header_tag.zeroize();
 
     let context = Arc::new(MessageContext::new(
@@ -1068,7 +1108,7 @@ pub fn start_encryption(
             keys,
             nonces,
         },
-        Header(header),
+        header,
     ))
 }
 
@@ -1096,33 +1136,23 @@ fn start_decryption_with_provider(
     parameters: Parameters,
     header: &Header,
 ) -> Result<DecryptionState> {
-    let header = header.as_bytes();
     let encoded = parameters.encode();
 
-    if header[..ENCODED_PARAMETERS_LENGTH] != encoded {
+    if header.encoded_parameters() != &encoded {
         return Err(Error::InvalidHeaderParameters);
     }
 
-    let mut floe_iv = [0u8; FLOE_IV_LENGTH];
-    floe_iv.copy_from_slice(
-        &header[ENCODED_PARAMETERS_LENGTH..ENCODED_PARAMETERS_LENGTH + FLOE_IV_LENGTH],
-    );
+    let floe_iv = *header.floe_iv();
 
-    let header_info: [&[u8]; 4] = [&encoded, &floe_iv, HEADER_TAG_PURPOSE, aad];
-    let mut expected_tag =
-        provider.kdf_expand::<HEADER_TAG_LENGTH>(key.as_bytes(), &header_info)?;
-    let tag_matches: bool = expected_tag
-        .as_slice()
-        .ct_eq(&header[ENCODED_PARAMETERS_LENGTH + FLOE_IV_LENGTH..])
-        .into();
+    let mut expected_tag = derive_header_tag(provider, key, &encoded, &floe_iv, aad)?;
+    let tag_matches: bool = expected_tag.as_slice().ct_eq(header.tag()).into();
     expected_tag.zeroize();
 
     if !tag_matches {
         return Err(Error::InvalidHeaderTag);
     }
 
-    let message_info: [&[u8]; 4] = [&encoded, &floe_iv, MESSAGE_KEY_PURPOSE, aad];
-    let message_key = SecretBytes(provider.kdf_expand::<48>(key.as_bytes(), &message_info)?);
+    let message_key = derive_message_key(provider, key, &encoded, &floe_iv, aad)?;
     let context = Arc::new(MessageContext::new(
         provider,
         parameters,
@@ -1151,6 +1181,30 @@ pub fn start_decryption_inferred(
     let provider = key.provider()?;
     let parameters = header.unverified_parameters()?;
     start_decryption_with_provider(key, provider, aad, parameters, header)
+}
+
+fn derive_header_tag(
+    provider: Provider,
+    key: &Key,
+    encoded: &[u8; ENCODED_PARAMETERS_LENGTH],
+    floe_iv: &[u8; FLOE_IV_LENGTH],
+    aad: &[u8],
+) -> Result<[u8; HEADER_TAG_LENGTH]> {
+    let info: [&[u8]; 4] = [encoded, floe_iv, HEADER_TAG_PURPOSE, aad];
+    provider.kdf_expand::<HEADER_TAG_LENGTH>(key.as_bytes(), &info)
+}
+
+fn derive_message_key(
+    provider: Provider,
+    key: &Key,
+    encoded: &[u8; ENCODED_PARAMETERS_LENGTH],
+    floe_iv: &[u8; FLOE_IV_LENGTH],
+    aad: &[u8],
+) -> Result<SecretBytes<48>> {
+    let info: [&[u8]; 4] = [encoded, floe_iv, MESSAGE_KEY_PURPOSE, aad];
+    Ok(SecretBytes(
+        provider.kdf_expand::<48>(key.as_bytes(), &info)?,
+    ))
 }
 
 fn derive_segment_key(

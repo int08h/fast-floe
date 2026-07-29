@@ -1,13 +1,11 @@
 use zeroize::Zeroize;
 
-use crate::{
-    Error, LengthRequirement, Parameters, Result, SEGMENT_OVERHEAD, SEGMENT_PAYLOAD_OFFSET,
-};
+use crate::{Error, LengthRequirement, Parameters, Result, SEGMENT_PAYLOAD_OFFSET};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BufferState {
     Empty,
-    Plaintext { offset: usize, length: usize },
+    Plaintext { length: usize },
     Ciphertext { length: usize },
 }
 
@@ -64,10 +62,7 @@ impl SegmentBuffer {
             });
         }
 
-        self.state = BufferState::Plaintext {
-            offset: SEGMENT_PAYLOAD_OFFSET,
-            length,
-        };
+        self.state = BufferState::Plaintext { length };
 
         let end = SEGMENT_PAYLOAD_OFFSET + length;
         Ok(&mut self.bytes[SEGMENT_PAYLOAD_OFFSET..end])
@@ -81,18 +76,7 @@ impl SegmentBuffer {
     /// Returns [`Error::InvalidCiphertextLength`] when `length` cannot
     /// represent a segment for this parameter set.
     pub fn prepare_ciphertext(&mut self, length: usize) -> Result<&mut [u8]> {
-        let maximum = self.parameters.ciphertext_segment_length();
-
-        if !(SEGMENT_OVERHEAD..=maximum).contains(&length) {
-            return Err(Error::InvalidCiphertextLength {
-                actual: length,
-                required: LengthRequirement::Between {
-                    minimum: SEGMENT_OVERHEAD,
-                    maximum,
-                },
-            });
-        }
-
+        self.parameters.validate_ciphertext_segment_length(length)?;
         self.state = BufferState::Ciphertext { length };
         Ok(&mut self.bytes[..length])
     }
@@ -105,7 +89,18 @@ impl SegmentBuffer {
     /// plaintext.
     pub fn plaintext(&self) -> Result<&[u8]> {
         match self.state {
-            BufferState::Plaintext { offset, length } => Ok(&self.bytes[offset..offset + length]),
+            BufferState::Plaintext { length } => {
+                Ok(&self.bytes[SEGMENT_PAYLOAD_OFFSET..SEGMENT_PAYLOAD_OFFSET + length])
+            }
+            BufferState::Empty | BufferState::Ciphertext { .. } => Err(Error::InvalidBufferState),
+        }
+    }
+
+    pub(crate) fn plaintext_mut(&mut self) -> Result<&mut [u8]> {
+        match self.state {
+            BufferState::Plaintext { length } => {
+                Ok(&mut self.bytes[SEGMENT_PAYLOAD_OFFSET..SEGMENT_PAYLOAD_OFFSET + length])
+            }
             BufferState::Empty | BufferState::Ciphertext { .. } => Err(Error::InvalidBufferState),
         }
     }
@@ -131,7 +126,7 @@ impl SegmentBuffer {
 
     pub(crate) const fn plaintext_length(&self) -> Result<usize> {
         match self.state {
-            BufferState::Plaintext { length, .. } => Ok(length),
+            BufferState::Plaintext { length } => Ok(length),
             BufferState::Empty | BufferState::Ciphertext { .. } => Err(Error::InvalidBufferState),
         }
     }
@@ -155,8 +150,8 @@ impl SegmentBuffer {
         self.state = BufferState::Ciphertext { length };
     }
 
-    pub(crate) const fn mark_plaintext(&mut self, offset: usize, length: usize) {
-        self.state = BufferState::Plaintext { offset, length };
+    pub(crate) const fn mark_plaintext(&mut self, length: usize) {
+        self.state = BufferState::Plaintext { length };
     }
 
     pub(crate) const fn mark_empty(&mut self) {
