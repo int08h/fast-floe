@@ -40,6 +40,10 @@ rayon = "1.12"
 name = "backend_matrix"
 harness = false
 
+[[bench]]
+name = "io_adapters"
+harness = false
+
 [profile.bench]
 lto = "thin"
 
