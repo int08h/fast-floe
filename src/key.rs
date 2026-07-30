@@ -192,4 +192,53 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn key_debug_is_redacted() {
+        // Given a key with a recognizable byte pattern
+        let key = Key::from_bytes([0xAB; Key::LEN]);
+
+        // When the key is formatted for debugging
+        let formatted = format!("{key:?}");
+
+        // Then the output is redacted and contains no key material
+        assert!(formatted.contains("REDACTED"));
+        assert!(!formatted.contains("ab"));
+        assert!(!formatted.contains("AB"));
+        assert!(!formatted.contains("171"));
+    }
+
+    #[test]
+    fn key_from_array_preserves_bytes() {
+        // Given a key converted from a byte array
+        let bytes = [0x42; Key::LEN];
+        let key = Key::from(bytes);
+
+        // Then it carries the same bytes as the explicit constructor
+        assert_eq!(key.as_bytes(), Key::from_bytes(bytes).as_bytes());
+    }
+
+    #[test]
+    fn key_try_from_slice_accepts_exact_length() {
+        // Given a slice of exactly Key::LEN bytes
+        let bytes = [0x42; Key::LEN];
+
+        // When it is converted, then the key preserves the bytes
+        let key = Key::try_from(&bytes[..]).unwrap();
+        assert_eq!(key.as_bytes(), &bytes);
+    }
+
+    #[test]
+    fn key_try_from_slice_rejects_short_and_long_inputs() {
+        // Given slices one byte shorter and one byte longer than a key
+        let bytes = [0x42; Key::LEN + 1];
+
+        // When each is converted, then the actual length is reported
+        for length in [Key::LEN - 1, Key::LEN + 1] {
+            assert!(matches!(
+                Key::try_from(&bytes[..length]),
+                Err(Error::InvalidKeyLength { actual }) if actual == length
+            ));
+        }
+    }
 }

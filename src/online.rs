@@ -1006,4 +1006,73 @@ mod tests {
             Err(Error::InvalidHeaderParameters)
         );
     }
+
+    #[test]
+    fn one_shot_decrypt_rejects_bytes_after_final_segment() {
+        // Given a valid single-segment ciphertext
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let ciphertext = encrypt(&test_key(), b"aad", parameters, b"one shot").unwrap();
+        let final_segment_length = ciphertext.len() - HEADER_LENGTH;
+
+        // When one byte or a whole second message follows the final segment
+        let mut one_extra_byte = ciphertext.clone();
+        one_extra_byte.push(0);
+        let mut second_message = ciphertext.clone();
+        second_message.extend_from_slice(&ciphertext);
+
+        // Then one-shot decryption rejects the oversized body exactly
+        for trailing in [one_extra_byte, second_message] {
+            let actual_body_length = trailing.len() - HEADER_LENGTH;
+            assert_eq!(
+                decrypt(&test_key(), b"aad", &trailing),
+                Err(Error::InvalidCiphertextLength {
+                    actual: actual_body_length,
+                    required: LengthRequirement::Exactly(final_segment_length),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn final_encrypt_error_exposes_error_and_parts() {
+        // Given a final-segment failure from an undersized output buffer
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let encryption = Encryptor::new(&test_key(), b"recover final", parameters).unwrap();
+        let mut too_small = [0u8; SEGMENT_OVERHEAD];
+        let failure = encryption
+            .encrypt_final_segment_into(b"retry", &mut too_small)
+            .unwrap_err();
+
+        // Then Display and source describe the underlying error
+        assert!(
+            failure
+                .to_string()
+                .contains("failed to encrypt final FLOE segment")
+        );
+        assert!(matches!(
+            std::error::Error::source(&failure).and_then(|source| source.downcast_ref::<Error>()),
+            Some(Error::OutputTooSmall { .. })
+        ));
+
+        // When the failure is separated into its parts
+        let (error, encryption) = failure.into_parts();
+
+        // Then the error matches and the recovered encryptor still encrypts
+        // a message its original header authenticates
+        assert!(matches!(error, Error::OutputTooSmall { .. }));
+        let header = *encryption.header();
+        let encrypted = encryption.encrypt_final_segment(b"retry").unwrap();
+        let mut decryption = Decryptor::new(&test_key(), b"recover final", &header).unwrap();
+        assert_eq!(decryption.decrypt_segment(&encrypted).unwrap(), b"retry");
+        decryption.finish().unwrap();
+
+        // When a separate failure is consumed for its error alone
+        let encryption = Encryptor::new(&test_key(), b"recover final", parameters).unwrap();
+        let failure = encryption
+            .encrypt_final_segment_into(b"retry", &mut too_small)
+            .unwrap_err();
+
+        // Then into_error yields the same classification
+        assert!(matches!(failure.into_error(), Error::OutputTooSmall { .. }));
+    }
 }

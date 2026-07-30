@@ -486,7 +486,7 @@ mod tests {
 
     use super::*;
     use crate::key::test_key;
-    use crate::{Parameters, encrypt};
+    use crate::{LengthRequirement, Parameters, encrypt};
 
     /// Delegating reader that counts how many `seek` calls reach the
     /// underlying stream.
@@ -506,6 +506,97 @@ mod tests {
             self.seeks.set(self.seeks.get() + 1);
             self.inner.seek(position)
         }
+    }
+
+    /// Delegating seekable reader with injectable seek and read failures and
+    /// an optional cap on total bytes served, after which it reports end of
+    /// stream early.
+    struct FailingSeeker<R> {
+        inner: R,
+        fail_seeks: bool,
+        fail_reads: bool,
+        remaining: Option<usize>,
+    }
+
+    impl<R> FailingSeeker<R> {
+        fn new(inner: R) -> Self {
+            Self {
+                inner,
+                fail_seeks: false,
+                fail_reads: false,
+                remaining: None,
+            }
+        }
+    }
+
+    impl<R: Read> Read for FailingSeeker<R> {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if self.fail_reads {
+                return Err(io::Error::other("injected read failure"));
+            }
+            match self.remaining {
+                None => self.inner.read(output),
+                Some(remaining) => {
+                    let allowed = remaining.min(output.len());
+                    let read = self.inner.read(&mut output[..allowed])?;
+                    self.remaining = Some(remaining - read);
+                    Ok(read)
+                }
+            }
+        }
+    }
+
+    impl<R: Seek> Seek for FailingSeeker<R> {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            if self.fail_seeks {
+                return Err(io::Error::other("injected seek failure"));
+            }
+            self.inner.seek(position)
+        }
+    }
+
+    /// Broken `Seek` implementation whose reported end position lies before
+    /// the message start.
+    #[derive(Debug)]
+    struct LyingEndSeeker(Cursor<Vec<u8>>);
+
+    impl Read for LyingEndSeeker {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            self.0.read(output)
+        }
+    }
+
+    impl Seek for LyingEndSeeker {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            match position {
+                SeekFrom::End(_) => Ok(0),
+                other => self.0.seek(other),
+            }
+        }
+    }
+
+    type FailingSeekerReader = Reader<FailingSeeker<Cursor<Vec<u8>>>>;
+
+    fn failing_reader_fixture() -> (FailingSeekerReader, Vec<u8>, Parameters) {
+        let key = test_key();
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let plaintext: Vec<u8> = (0..2 * parameters.plaintext_segment_length() + 37)
+            .map(|position| u8::try_from(position % 251).unwrap())
+            .collect();
+        let ciphertext = encrypt(&key, b"random reader", parameters, &plaintext).unwrap();
+        let reader = Reader::new(
+            FailingSeeker::new(Cursor::new(ciphertext)),
+            &key,
+            b"random reader",
+        )
+        .unwrap();
+        (reader, plaintext, parameters)
+    }
+
+    fn crate_error(error: &io::Error) -> Option<&Error> {
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<Error>())
     }
 
     fn framed_reader_fixture() -> (Reader<Cursor<Vec<u8>>>, Vec<u8>, Parameters) {
@@ -835,5 +926,217 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn read_range_into_writes_exact_range() {
+        // Given a range spanning a partial, a full, and a partial segment
+        let (mut reader, plaintext, parameters) = framed_reader_fixture();
+        let capacity = parameters.plaintext_segment_length();
+        let start = capacity - 7;
+        let end = 2 * capacity + 5;
+        let required = end - start;
+
+        // When the range is read into an oversized output allocation
+        let mut output = vec![0xEE; required + 9];
+        let written = reader
+            .read_range_into(
+                u64::try_from(start).unwrap()..u64::try_from(end).unwrap(),
+                &mut output,
+            )
+            .unwrap();
+
+        // Then exactly the requested bytes are written and the remainder of
+        // the allocation is untouched
+        assert_eq!(written, required);
+        assert_eq!(&output[..written], &plaintext[start..end]);
+        assert!(output[written..].iter().all(|&byte| byte == 0xEE));
+    }
+
+    #[test]
+    fn read_range_into_rejects_small_output() {
+        // Given an output allocation one byte too small for the range
+        let (mut reader, _, _) = framed_reader_fixture();
+        let mut output = [0u8; 9];
+
+        // When the range is read into it
+        let error = reader.read_range_into(0u64..10, &mut output).unwrap_err();
+
+        // Then the exact shortfall is classified as invalid input
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(matches!(
+            crate_error(&error),
+            Some(Error::OutputTooSmall {
+                actual: 9,
+                required: 10,
+            })
+        ));
+    }
+
+    #[test]
+    fn empty_range_reads_no_segments() {
+        // Given a reader whose source fails on any further seek or read
+        let (mut reader, _, _) = failing_reader_fixture();
+        reader.get_mut().fail_seeks = true;
+        reader.get_mut().fail_reads = true;
+
+        // When empty ranges are read through both range APIs
+        // Then both succeed without performing any I/O
+        assert_eq!(reader.read_range(7u64..7).unwrap(), Vec::<u8>::new());
+        let mut output = [0u8; 4];
+        assert_eq!(reader.read_range_into(7u64..7, &mut output).unwrap(), 0);
+    }
+
+    #[test]
+    fn read_segment_rejects_position_equal_to_segment_count() {
+        // Given a reader over a three-segment message
+        let (mut reader, _, _) = framed_reader_fixture();
+        let count = reader.segment_count();
+        assert_eq!(count, 3);
+
+        // When the first out-of-range position is read
+        let error = reader.read_segment(count).unwrap_err();
+
+        // Then the position and valid range are reported as invalid input
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("position {count} is outside 0..{count}"))
+        );
+    }
+
+    #[test]
+    fn range_bounds_overflowing_u64_are_rejected() {
+        // Given range bounds whose resolution overflows u64
+        struct ExcludedMaxStart;
+
+        impl RangeBounds<u64> for ExcludedMaxStart {
+            fn start_bound(&self) -> Bound<&u64> {
+                Bound::Excluded(&u64::MAX)
+            }
+
+            fn end_bound(&self) -> Bound<&u64> {
+                Bound::Unbounded
+            }
+        }
+
+        let (mut reader, _, _) = framed_reader_fixture();
+
+        // When either overflowing form is read
+        // Then both are classified as invalid input carrying LengthOverflow
+        for error in [
+            reader.read_range(ExcludedMaxStart).unwrap_err(),
+            reader.read_range(0..=u64::MAX).unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(matches!(crate_error(&error), Some(Error::LengthOverflow)));
+        }
+    }
+
+    #[test]
+    fn seek_failure_while_loading_a_segment_propagates() {
+        // Given a reader whose source rejects seeks, with the tracked
+        // position discarded by get_mut
+        let (mut reader, plaintext, parameters) = failing_reader_fixture();
+        reader.get_mut().fail_seeks = true;
+
+        // When a non-cached segment is loaded
+        let error = reader.read_segment(1).unwrap_err();
+
+        // Then the injected failure is propagated
+        assert!(error.to_string().contains("injected seek failure"));
+
+        // Then clearing the fault restores the reader
+        reader.get_mut().fail_seeks = false;
+        assert_eq!(
+            reader.read_segment(1).unwrap(),
+            plaintext
+                [parameters.plaintext_segment_length()..2 * parameters.plaintext_segment_length()]
+        );
+    }
+
+    #[test]
+    fn read_failure_after_successful_seek_propagates() {
+        // Given a reader whose source fails reads but not seeks
+        let (mut reader, _, _) = failing_reader_fixture();
+        reader.get_mut().fail_reads = true;
+
+        // When a segment is loaded, then the injected failure is propagated
+        let error = reader.read_segment(1).unwrap_err();
+        assert!(error.to_string().contains("injected read failure"));
+    }
+
+    #[test]
+    fn short_segment_read_reports_exact_length_diagnostics() {
+        // Given a source that serves only 100 more bytes of a full segment
+        let (mut reader, _, parameters) = failing_reader_fixture();
+        reader.get_mut().remaining = Some(100);
+
+        // When the full first segment is read
+        let error = reader.read_segment(0).unwrap_err();
+
+        // Then the short read is classified with both exact lengths
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(
+            crate_error(&error),
+            Some(Error::InvalidCiphertextLength {
+                actual: 100,
+                required: LengthRequirement::Exactly(required),
+            }) if *required == parameters.ciphertext_segment_length()
+        ));
+    }
+
+    #[test]
+    fn construction_rejects_end_position_before_message_start() {
+        // Given a broken source whose reported end lies before the message
+        // start position
+        let key = test_key();
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let ciphertext = encrypt(&key, b"random reader", parameters, b"data").unwrap();
+        let mut framed = b"pre".to_vec();
+        framed.extend_from_slice(&ciphertext);
+        let mut cursor = Cursor::new(framed);
+        cursor.set_position(3);
+
+        // When a reader is constructed over it
+        let error = Reader::new(LyingEndSeeker(cursor), &key, b"random reader").unwrap_err();
+
+        // Then the impossible geometry is rejected as invalid data
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains("ends before its starting position")
+        );
+    }
+
+    #[test]
+    fn accessors_and_plaintext_position_are_observable() {
+        // Given a reader over a three-segment message
+        let (mut reader, plaintext, parameters) = framed_reader_fixture();
+        let total = u64::try_from(plaintext.len()).unwrap();
+
+        // Then the header, layout, and count accessors agree with the
+        // authenticated message geometry
+        assert_eq!(reader.header().unverified_parameters().unwrap(), parameters);
+        assert_eq!(reader.layout().plaintext_length(), total);
+        assert_eq!(reader.layout().segment_count(), 3);
+        assert_eq!(reader.segment_count(), 3);
+        assert!(reader.get_ref().position() > 0);
+
+        // When the plaintext view seeks and reads
+        // Then empty reads leave the position alone and reads advance it
+        reader.seek(SeekFrom::Start(5)).unwrap();
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        assert_eq!(reader.stream_position().unwrap(), 5);
+        let mut chunk = [0u8; 4];
+        reader.read_exact(&mut chunk).unwrap();
+        assert_eq!(chunk, plaintext[5..9]);
+        assert_eq!(reader.stream_position().unwrap(), 9);
+
+        // Then the wrapped reader is recoverable
+        let inner = reader.into_inner();
+        assert!(inner.position() > 0);
     }
 }

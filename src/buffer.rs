@@ -268,4 +268,97 @@ mod tests {
         buffer.clear();
         assert_eq!(buffer.truncate_plaintext(0), Err(Error::InvalidBufferState));
     }
+
+    #[test]
+    fn prepare_plaintext_rejects_length_above_capacity() {
+        // Given a payload length one byte over the segment capacity
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let capacity = parameters.plaintext_segment_length();
+        let mut buffer = SegmentBuffer::new(parameters);
+
+        // When the oversized payload is prepared
+        // Then the exact limit is reported
+        assert!(matches!(
+            buffer.prepare_plaintext(capacity + 1),
+            Err(Error::InvalidPlaintextLength {
+                actual,
+                required: LengthRequirement::AtMost(maximum),
+            }) if actual == capacity + 1 && maximum == capacity
+        ));
+
+        // Then the rejected preparation leaves nothing readable
+        assert_eq!(buffer.plaintext(), Err(Error::InvalidBufferState));
+    }
+
+    #[test]
+    fn prepare_ciphertext_rejects_lengths_outside_segment_bounds() {
+        // Given lengths below the framing overhead and above one segment
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let maximum = parameters.ciphertext_segment_length();
+        let mut buffer = SegmentBuffer::new(parameters);
+
+        // When each invalid length is prepared
+        // Then the valid range is reported and nothing becomes readable
+        for length in [SEGMENT_OVERHEAD - 1, maximum + 1] {
+            assert!(matches!(
+                buffer.prepare_ciphertext(length),
+                Err(Error::InvalidCiphertextLength {
+                    actual,
+                    required: LengthRequirement::Between {
+                        minimum: SEGMENT_OVERHEAD,
+                        maximum: reported,
+                    },
+                }) if actual == length && reported == maximum
+            ));
+            assert_eq!(buffer.ciphertext(), Err(Error::InvalidBufferState));
+        }
+
+        // When the boundary lengths are prepared, then both are accepted
+        assert_eq!(
+            buffer.prepare_ciphertext(SEGMENT_OVERHEAD).unwrap().len(),
+            SEGMENT_OVERHEAD
+        );
+        assert_eq!(buffer.prepare_ciphertext(maximum).unwrap().len(), maximum);
+    }
+
+    #[test]
+    fn plaintext_rejects_empty_and_ciphertext_states() {
+        // Given an empty buffer
+        let mut buffer = SegmentBuffer::new(Parameters::SEGMENT_4_KIB);
+
+        // Then no plaintext is readable while empty
+        assert_eq!(buffer.plaintext(), Err(Error::InvalidBufferState));
+
+        // Then no plaintext is readable while holding a ciphertext segment
+        buffer.prepare_ciphertext(SEGMENT_OVERHEAD + 3).unwrap();
+        assert_eq!(buffer.plaintext(), Err(Error::InvalidBufferState));
+    }
+
+    #[test]
+    fn ciphertext_rejects_empty_and_plaintext_states() {
+        // Given an empty buffer
+        let mut buffer = SegmentBuffer::new(Parameters::SEGMENT_4_KIB);
+
+        // Then no ciphertext is readable while empty
+        assert_eq!(buffer.ciphertext(), Err(Error::InvalidBufferState));
+
+        // Then no ciphertext is readable while holding plaintext
+        buffer.prepare_plaintext(3).unwrap().copy_from_slice(b"abc");
+        assert_eq!(buffer.ciphertext(), Err(Error::InvalidBufferState));
+    }
+
+    #[test]
+    fn capacity_matches_parameters() {
+        // Given buffers for each standard parameter set
+        for parameters in [
+            Parameters::SEGMENT_64_B,
+            Parameters::SEGMENT_4_KIB,
+            Parameters::SEGMENT_1_MIB,
+        ] {
+            // Then each capacity equals one complete encrypted segment
+            let buffer = SegmentBuffer::new(parameters);
+            assert_eq!(buffer.capacity(), parameters.ciphertext_segment_length());
+            assert_eq!(buffer.parameters(), parameters);
+        }
+    }
 }

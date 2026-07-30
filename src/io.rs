@@ -852,6 +852,85 @@ mod tests {
         }
     }
 
+    /// Accepts writes until a configured byte budget is exhausted, then fails
+    /// every write; counts calls so tests can prove a poisoned adapter stops
+    /// touching its sink.
+    #[derive(Debug)]
+    struct FailingWriter {
+        accepted: Vec<u8>,
+        budget: usize,
+        write_calls: usize,
+    }
+
+    impl FailingWriter {
+        fn new(budget: usize) -> Self {
+            Self {
+                accepted: Vec::new(),
+                budget,
+                write_calls: 0,
+            }
+        }
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            self.write_calls += 1;
+            if self.accepted.len() + input.len() > self.budget {
+                return Err(io::Error::other("injected write failure"));
+            }
+            self.accepted.extend_from_slice(input);
+            Ok(input.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Serves its configured data, then returns an injected error where a
+    /// well-behaved reader would report end of stream.
+    #[derive(Debug)]
+    struct FailingReader {
+        data: Cursor<Vec<u8>>,
+    }
+
+    impl Read for FailingReader {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            let read = self.data.read(output)?;
+            if read == 0 {
+                return Err(io::Error::other("injected read failure"));
+            }
+            Ok(read)
+        }
+    }
+
+    /// Returns `ErrorKind::Interrupted` on every other call, serving data in
+    /// between, so retry loops must preserve progress across interruptions.
+    #[derive(Debug)]
+    struct InterruptedReader {
+        data: Cursor<Vec<u8>>,
+        interrupt_next: bool,
+    }
+
+    impl Read for InterruptedReader {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            self.interrupt_next = !self.interrupt_next;
+            if self.interrupt_next {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "injected interruption",
+                ));
+            }
+            self.data.read(output)
+        }
+    }
+
+    fn crate_error(error: &io::Error) -> Option<&Error> {
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<Error>())
+    }
+
     #[test]
     fn encrypt_reader_round_trips_plaintext_boundaries() {
         // Given plaintext lengths at and around the segment boundary
@@ -1342,5 +1421,463 @@ mod tests {
         // parameters are available for a policy check
         let reader = DecryptReader::new(Cursor::new(ciphertext), &test_key(), b"io").unwrap();
         assert_eq!(reader.parameters(), parameters);
+    }
+
+    #[test]
+    fn writer_rejects_writes_after_finish() {
+        // Given a writer finalized in place
+        let mut writer =
+            EncryptWriter::new(Vec::new(), &test_key(), b"io", Parameters::SEGMENT_4_KIB).unwrap();
+        writer.write_all(b"message").unwrap();
+        writer.try_finish().unwrap();
+        assert!(writer.is_finished());
+
+        // When more plaintext is written, then the write is rejected
+        assert_eq!(
+            writer.write(b"more").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+
+        // Then the documented empty-write early return still applies
+        assert_eq!(writer.write(&[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn writer_try_finish_is_idempotent_after_success() {
+        // Given a writer finalized in place
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let mut writer = EncryptWriter::new(Vec::new(), &test_key(), b"io", parameters).unwrap();
+        let header = *writer.header();
+        writer.write_all(b"message").unwrap();
+        writer.try_finish().unwrap();
+        let emitted = writer.get_ref().len();
+
+        // When finalization is requested again
+        writer.try_finish().unwrap();
+
+        // Then no additional bytes are written and the message round-trips
+        assert_eq!(writer.get_ref().len(), emitted);
+        let ciphertext = writer.finish().unwrap();
+        assert_eq!(&ciphertext[..Header::LEN], header.as_bytes());
+        assert_eq!(
+            decrypt(&test_key(), b"io", &ciphertext).unwrap(),
+            b"message"
+        );
+    }
+
+    #[test]
+    fn writer_empty_write_is_a_noop() {
+        // Given a fresh writer
+        let mut writer =
+            EncryptWriter::new(Vec::new(), &test_key(), b"io", Parameters::SEGMENT_4_KIB).unwrap();
+
+        // When empty writes surround a buffered write
+        assert_eq!(writer.write(&[]).unwrap(), 0);
+        writer.write_all(b"buffered").unwrap();
+        assert_eq!(writer.write(&[]).unwrap(), 0);
+
+        // Then no segment was emitted and the message still round-trips
+        assert_eq!(writer.get_ref().len(), Header::LEN);
+        let ciphertext = writer.finish().unwrap();
+        assert_eq!(
+            decrypt(&test_key(), b"io", &ciphertext).unwrap(),
+            b"buffered"
+        );
+    }
+
+    #[test]
+    fn writer_is_poisoned_after_segment_write_failure() {
+        // Given a sink that accepts only the header
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let capacity = parameters.plaintext_segment_length();
+        let mut writer = EncryptWriter::new(
+            FailingWriter::new(Header::LEN),
+            &test_key(),
+            b"io",
+            parameters,
+        )
+        .unwrap();
+
+        // When a full non-final segment fails to reach the sink
+        let error = writer.write(&vec![0x33; capacity]).unwrap_err();
+        assert!(error.to_string().contains("injected write failure"));
+
+        // Then write, flush, and try_finish report the poisoned stream
+        // without touching the sink again
+        let calls = writer.get_ref().write_calls;
+        for error in [
+            writer.write(b"x").unwrap_err(),
+            writer.flush().unwrap_err(),
+            writer.try_finish().unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("poisoned"));
+        }
+        assert_eq!(writer.get_ref().write_calls, calls);
+        assert_eq!(writer.get_ref().accepted.len(), Header::LEN);
+    }
+
+    #[test]
+    fn writer_is_poisoned_after_final_segment_write_failure() {
+        // Given buffered plaintext and a sink that accepts only the header
+        let mut writer = EncryptWriter::new(
+            FailingWriter::new(Header::LEN),
+            &test_key(),
+            b"io",
+            Parameters::SEGMENT_4_KIB,
+        )
+        .unwrap();
+        writer.write_all(b"partial final").unwrap();
+
+        // When finalization fails while emitting the final segment
+        let error = writer.try_finish().unwrap_err();
+        assert!(error.to_string().contains("injected write failure"));
+
+        // Then later finalization attempts report the poisoned stream
+        assert!(!writer.is_finished());
+        assert!(
+            writer
+                .try_finish()
+                .unwrap_err()
+                .to_string()
+                .contains("poisoned")
+        );
+    }
+
+    #[test]
+    fn finish_error_exposes_standard_error_interfaces() {
+        // Given a finalization failure from a flush-failing sink
+        let mut writer = EncryptWriter::new(
+            FlushFails::default(),
+            &test_key(),
+            b"io",
+            Parameters::SEGMENT_4_KIB,
+        )
+        .unwrap();
+        writer.write_all(b"message").unwrap();
+        let failure = writer.finish().unwrap_err();
+
+        // Then Display, Debug, and source describe the failure without
+        // exposing the wrapped sink's contents
+        assert!(failure.to_string().contains("failed to finish FLOE stream"));
+        let debug = format!("{failure:?}");
+        assert!(debug.contains("FinishError"));
+        assert!(debug.contains("injected flush failure"));
+        let source = std::error::Error::source(&failure).unwrap();
+        assert!(source.to_string().contains("injected flush failure"));
+
+        // Then into_parts separates the error from the recovered sink
+        let (error, sink) = failure.into_parts();
+        assert!(error.to_string().contains("injected flush failure"));
+        assert!(!sink.0.is_empty());
+    }
+
+    #[test]
+    fn encrypt_reader_empty_read_is_a_noop() {
+        // Given a fresh encrypting reader
+        let mut reader = EncryptReader::new(
+            Cursor::new(b"data".to_vec()),
+            &test_key(),
+            b"io",
+            Parameters::SEGMENT_4_KIB,
+        )
+        .unwrap();
+
+        // When an empty read is issued, then it returns zero without
+        // disturbing the stream
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        let mut ciphertext = Vec::new();
+        reader.read_to_end(&mut ciphertext).unwrap();
+        assert_eq!(decrypt(&test_key(), b"io", &ciphertext).unwrap(), b"data");
+    }
+
+    #[test]
+    fn encrypt_reader_poisoned_after_source_read_failure() {
+        // Given a plaintext source that fails after ten bytes, exercised
+        // through both the buffered and direct segment paths
+        let parameters = Parameters::SEGMENT_4_KIB;
+        for direct in [false, true] {
+            let source = FailingReader {
+                data: Cursor::new(vec![0x31; 10]),
+            };
+            let mut reader = EncryptReader::new(source, &test_key(), b"io", parameters).unwrap();
+            let mut header = [0u8; Header::LEN];
+            reader.read_exact(&mut header).unwrap();
+
+            // When the next segment needs plaintext from the failing source
+            let mut output = vec![
+                0u8;
+                if direct {
+                    parameters.ciphertext_segment_length()
+                } else {
+                    32
+                }
+            ];
+            let error = reader.read(&mut output).unwrap_err();
+            assert!(
+                error.to_string().contains("injected read failure"),
+                "unexpected first error on direct={direct}: {error}"
+            );
+
+            // Then later non-empty reads report the poisoned stream while
+            // empty reads keep their documented early return
+            let error = reader.read(&mut output).unwrap_err();
+            assert!(error.to_string().contains("poisoned"));
+            assert_eq!(reader.read(&mut []).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn encrypt_reader_accessors_preserve_inner_reader() {
+        // Given an encrypting reader over a short message
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let mut reader = EncryptReader::new(
+            Cursor::new(b"accessor data".to_vec()),
+            &test_key(),
+            b"io",
+            parameters,
+        )
+        .unwrap();
+        assert_eq!(reader.parameters(), parameters);
+        assert!(!reader.is_finished());
+        let header = *reader.header();
+
+        // When the ciphertext is drained
+        let mut ciphertext = Vec::new();
+        reader.read_to_end(&mut ciphertext).unwrap();
+
+        // Then the header accessor matches the emitted prefix and the
+        // wrapped reader is observable and recoverable
+        assert!(reader.is_finished());
+        assert_eq!(&ciphertext[..Header::LEN], header.as_bytes());
+        assert_eq!(reader.get_ref().position(), 13);
+        reader.get_mut().set_position(0);
+        let mut more = [0u8; 8];
+        assert_eq!(reader.read(&mut more).unwrap(), 0);
+        let inner = reader.into_inner_unfinished();
+        assert_eq!(inner.position(), 0);
+        assert_eq!(
+            decrypt(&test_key(), b"io", &ciphertext).unwrap(),
+            b"accessor data"
+        );
+    }
+
+    #[test]
+    fn decrypt_reader_empty_read_is_a_noop() {
+        // Given a decrypting reader over a valid message
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let ciphertext = encrypt(&test_key(), b"io", parameters, b"data").unwrap();
+        let mut reader = DecryptReader::new(Cursor::new(ciphertext), &test_key(), b"io").unwrap();
+
+        // When an empty read is issued, then it returns zero without
+        // disturbing the stream
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        let mut plaintext = Vec::new();
+        reader.read_to_end(&mut plaintext).unwrap();
+        assert_eq!(plaintext, b"data");
+        reader.try_finish().unwrap();
+    }
+
+    #[test]
+    fn decrypt_reader_poisoned_after_truncated_prefix() {
+        // Given a two-segment message cut off inside the second segment's
+        // prefix
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let capacity = parameters.plaintext_segment_length();
+        let plaintext = vec![0x37; capacity + 10];
+        let mut ciphertext = encrypt(&test_key(), b"io", parameters, &plaintext).unwrap();
+        ciphertext.truncate(Header::LEN + parameters.ciphertext_segment_length() + 2);
+        let mut reader = DecryptReader::new(Cursor::new(ciphertext), &test_key(), b"io").unwrap();
+
+        // When the message is drained through sub-segment reads
+        let mut recovered = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let error = loop {
+            match reader.read(&mut chunk) {
+                Ok(read) => recovered.extend_from_slice(&chunk[..read]),
+                Err(error) => break error,
+            }
+        };
+
+        // Then only the authenticated first segment was returned and the
+        // failure is classified as truncation
+        assert_eq!(recovered, plaintext[..capacity]);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(crate_error(&error), Some(Error::Truncated)));
+
+        // Then later reads report the poisoned stream
+        let error = reader.read(&mut chunk).unwrap_err();
+        assert!(error.to_string().contains("poisoned"));
+    }
+
+    #[test]
+    fn decrypt_reader_poisoned_after_truncated_segment_body() {
+        // Given a single-segment message missing its last three bytes
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let ciphertext = encrypt(&test_key(), b"io", parameters, b"message").unwrap();
+        let segment_length = ciphertext.len() - Header::LEN;
+        let mut truncated = ciphertext;
+        truncated.truncate(Header::LEN + segment_length - 3);
+        let mut reader = DecryptReader::new(Cursor::new(truncated), &test_key(), b"io").unwrap();
+
+        // When the segment body comes up short
+        let mut chunk = [0u8; 4];
+        let error = reader.read(&mut chunk).unwrap_err();
+
+        // Then the exact length diagnosis is preserved and the reader is
+        // poisoned
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(
+            crate_error(&error),
+            Some(Error::InvalidCiphertextLength {
+                actual,
+                required: LengthRequirement::Exactly(required),
+            }) if *actual == segment_length - 3 && *required == segment_length
+        ));
+        assert!(
+            reader
+                .read(&mut chunk)
+                .unwrap_err()
+                .to_string()
+                .contains("poisoned")
+        );
+    }
+
+    #[test]
+    fn decrypt_reader_returns_no_plaintext_after_tag_corruption() {
+        // Given a single-segment message with a corrupted authentication
+        // tag, exercised through both the buffered and direct read paths
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let capacity = parameters.plaintext_segment_length();
+        let ciphertext = encrypt(&test_key(), b"io", parameters, b"secret payload").unwrap();
+        for direct in [false, true] {
+            let mut corrupted = ciphertext.clone();
+            *corrupted.last_mut().unwrap() ^= 0x01;
+            let mut reader =
+                DecryptReader::new(Cursor::new(corrupted), &test_key(), b"io").unwrap();
+
+            // When the corrupted segment is read
+            let mut output = vec![0u8; if direct { capacity } else { 4 }];
+            let error = reader.read(&mut output).unwrap_err();
+
+            // Then no plaintext is returned, the failure is classified, and
+            // the reader stays poisoned
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                matches!(crate_error(&error), Some(Error::AuthenticationFailed)),
+                "unexpected error on direct={direct}: {error}"
+            );
+            assert!(
+                reader
+                    .read(&mut output)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("poisoned")
+            );
+        }
+    }
+
+    #[test]
+    fn decrypt_reader_finish_propagates_underlying_read_error() {
+        // Given a complete message whose source fails at end of stream
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let ciphertext = encrypt(&test_key(), b"io", parameters, b"message").unwrap();
+        let source = FailingReader {
+            data: Cursor::new(ciphertext),
+        };
+        let mut reader = DecryptReader::new(source, &test_key(), b"io").unwrap();
+        let mut plaintext = Vec::new();
+        let mut chunk = [0u8; 5];
+        loop {
+            let read = reader.read(&mut chunk).unwrap();
+            if read == 0 {
+                break;
+            }
+            plaintext.extend_from_slice(&chunk[..read]);
+        }
+        assert_eq!(plaintext, b"message");
+
+        // When the trailing-data check hits the injected source error
+        let error = reader.try_finish().unwrap_err();
+        assert!(error.to_string().contains("injected read failure"));
+
+        // Then the reader is poisoned for finalization and reads alike
+        assert!(
+            reader
+                .try_finish()
+                .unwrap_err()
+                .to_string()
+                .contains("poisoned")
+        );
+        assert!(
+            reader
+                .read(&mut chunk)
+                .unwrap_err()
+                .to_string()
+                .contains("poisoned")
+        );
+    }
+
+    #[test]
+    fn decrypt_reader_try_finish_is_idempotent_after_success() {
+        // Given a reader finished successfully in place
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let ciphertext = encrypt(&test_key(), b"io", parameters, b"message").unwrap();
+        let mut reader = DecryptReader::new(Cursor::new(ciphertext), &test_key(), b"io").unwrap();
+        reader.try_finish().unwrap();
+
+        // When finalization is requested again, then it still succeeds
+        reader.try_finish().unwrap();
+        assert!(reader.is_finished());
+    }
+
+    #[test]
+    fn decrypt_reader_accessors_and_unchecked_extraction_are_observable() {
+        // Given a decrypting reader over a valid message
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let ciphertext = encrypt(&test_key(), b"io", parameters, b"peek").unwrap();
+        let mut reader =
+            DecryptReader::new(Cursor::new(ciphertext.clone()), &test_key(), b"io").unwrap();
+
+        // Then the accessors reflect the authenticated header and the
+        // wrapped reader's position past it
+        assert_eq!(reader.header().as_bytes(), &ciphertext[..Header::LEN]);
+        assert_eq!(reader.parameters(), parameters);
+        assert!(!reader.is_finished());
+        assert_eq!(
+            reader.get_ref().position(),
+            u64::try_from(Header::LEN).unwrap()
+        );
+
+        // When the wrapped reader is repositioned through get_mut and
+        // extracted unchecked, then no draining or authentication happens
+        reader.get_mut().set_position(0);
+        let inner = reader.into_inner_unchecked();
+        assert_eq!(inner.position(), 0);
+    }
+
+    #[test]
+    fn decrypt_reader_retries_interrupted_reads() {
+        // Given a multi-segment message served with an interruption before
+        // every successful source read
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let capacity = parameters.plaintext_segment_length();
+        let plaintext: Vec<u8> = (0..2 * capacity + 5)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect();
+        let ciphertext = encrypt(&test_key(), b"io", parameters, &plaintext).unwrap();
+        let source = InterruptedReader {
+            data: Cursor::new(ciphertext),
+            interrupt_next: false,
+        };
+
+        // When the message is decrypted end to end
+        let mut reader = DecryptReader::new(source, &test_key(), b"io").unwrap();
+        let mut recovered = Vec::new();
+        reader.read_to_end(&mut recovered).unwrap();
+        reader.try_finish().unwrap();
+
+        // Then interruptions were retried without losing any progress
+        assert_eq!(recovered, plaintext);
+        assert!(reader.is_finished());
     }
 }
