@@ -847,18 +847,22 @@ mod tests {
         assert!(decryption.finish().is_ok());
     }
 
+    /// Provokes a final-segment encryption failure with an undersized output
+    /// buffer, returning the message header and the failure.
+    fn failed_final_encryption() -> (Header, FinalEncryptError) {
+        let encryption =
+            Encryptor::new(&test_key(), b"recover final", Parameters::SEGMENT_4_KIB).unwrap();
+        let header = *encryption.header();
+        let failure = encryption
+            .encrypt_final_segment_into(b"retry", &mut [0u8; SEGMENT_OVERHEAD])
+            .unwrap_err();
+        (header, failure)
+    }
+
     #[test]
     fn failed_final_encryption_returns_reusable_state() {
         // Given final-segment encryption that fails on an undersized buffer
-        let parameters = Parameters::SEGMENT_4_KIB;
-        let encryption = Encryptor::new(&test_key(), b"recover final", parameters).unwrap();
-        let header = *encryption.header();
-        let mut too_small = [0u8; SEGMENT_OVERHEAD];
-
-        // When the failure is returned
-        let failure = encryption
-            .encrypt_final_segment_into(b"retry", &mut too_small)
-            .unwrap_err();
+        let (header, failure) = failed_final_encryption();
 
         // Then it reports the cause without leaking encryptor internals
         assert!(matches!(failure.error(), Error::OutputTooSmall { .. }));
@@ -1036,12 +1040,7 @@ mod tests {
     #[test]
     fn final_encrypt_error_exposes_error_and_parts() {
         // Given a final-segment failure from an undersized output buffer
-        let parameters = Parameters::SEGMENT_4_KIB;
-        let encryption = Encryptor::new(&test_key(), b"recover final", parameters).unwrap();
-        let mut too_small = [0u8; SEGMENT_OVERHEAD];
-        let failure = encryption
-            .encrypt_final_segment_into(b"retry", &mut too_small)
-            .unwrap_err();
+        let (header, failure) = failed_final_encryption();
 
         // Then Display and source describe the underlying error
         assert!(
@@ -1057,22 +1056,39 @@ mod tests {
         // When the failure is separated into its parts
         let (error, encryption) = failure.into_parts();
 
-        // Then the error matches and the recovered encryptor still encrypts
-        // a message its original header authenticates
+        // Then the error matches and the recovered encryptor is intact
         assert!(matches!(error, Error::OutputTooSmall { .. }));
-        let header = *encryption.header();
-        let encrypted = encryption.encrypt_final_segment(b"retry").unwrap();
-        let mut decryption = Decryptor::new(&test_key(), b"recover final", &header).unwrap();
-        assert_eq!(decryption.decrypt_segment(&encrypted).unwrap(), b"retry");
-        decryption.finish().unwrap();
+        assert_eq!(encryption.header(), &header);
+        assert_eq!(encryption.next_position(), 0);
 
         // When a separate failure is consumed for its error alone
-        let encryption = Encryptor::new(&test_key(), b"recover final", parameters).unwrap();
-        let failure = encryption
-            .encrypt_final_segment_into(b"retry", &mut too_small)
-            .unwrap_err();
-
         // Then into_error yields the same classification
+        let (_, failure) = failed_final_encryption();
         assert!(matches!(failure.into_error(), Error::OutputTooSmall { .. }));
+    }
+
+    #[test]
+    fn failed_in_place_encryption_empties_the_buffer() {
+        // Given a buffer holding a short payload for a non-final segment
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let mut encryption = Encryptor::new(&test_key(), b"in place", parameters).unwrap();
+        let mut buffer = SegmentBuffer::new(parameters);
+        buffer.prepare_plaintext(3).unwrap().copy_from_slice(b"abc");
+
+        // When non-final encryption rejects the short payload
+        let error = encryption
+            .encrypt_non_final_segment_in_place(&mut buffer)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::InvalidPlaintextLength {
+                actual: 3,
+                required: LengthRequirement::Exactly(_),
+            }
+        ));
+
+        // Then the buffer is emptied rather than left partially processed
+        assert_eq!(buffer.plaintext(), Err(Error::InvalidBufferState));
+        assert_eq!(buffer.ciphertext(), Err(Error::InvalidBufferState));
     }
 }

@@ -140,3 +140,11 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// Returns the crate error carried as a wrapped `io::Error` source.
+#[cfg(test)]
+pub(crate) fn crate_error(error: &std::io::Error) -> Option<&Error> {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<Error>())
+}

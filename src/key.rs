@@ -214,8 +214,8 @@ mod tests {
         let bytes = [0x42; Key::LEN];
         let key = Key::from(bytes);
 
-        // Then it carries the same bytes as the explicit constructor
-        assert_eq!(key.as_bytes(), Key::from_bytes(bytes).as_bytes());
+        // Then it carries the same bytes
+        assert_eq!(key.as_bytes(), &bytes);
     }
 
     #[test]

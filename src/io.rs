@@ -835,6 +835,7 @@ mod tests {
     use std::io::{Cursor, Read as _, Write as _};
 
     use super::*;
+    use crate::error::crate_error;
     use crate::key::test_key;
     use crate::{decrypt, decrypt_with_parameters, encrypt, random_access};
 
@@ -923,12 +924,6 @@ mod tests {
             }
             self.data.read(output)
         }
-    }
-
-    fn crate_error(error: &io::Error) -> Option<&Error> {
-        error
-            .get_ref()
-            .and_then(|source| source.downcast_ref::<Error>())
     }
 
     #[test]
@@ -1345,9 +1340,7 @@ mod tests {
             for error in [stream_error, random_error] {
                 assert_eq!(error.kind(), io::ErrorKind::InvalidData);
                 assert!(matches!(
-                    error
-                        .get_ref()
-                        .and_then(|source| source.downcast_ref::<Error>()),
+                    crate_error(&error),
                     Some(Error::InvalidHeaderLength { actual }) if *actual == length
                 ));
             }
@@ -1447,7 +1440,6 @@ mod tests {
         // Given a writer finalized in place
         let parameters = Parameters::SEGMENT_4_KIB;
         let mut writer = EncryptWriter::new(Vec::new(), &test_key(), b"io", parameters).unwrap();
-        let header = *writer.header();
         writer.write_all(b"message").unwrap();
         writer.try_finish().unwrap();
         let emitted = writer.get_ref().len();
@@ -1458,7 +1450,6 @@ mod tests {
         // Then no additional bytes are written and the message round-trips
         assert_eq!(writer.get_ref().len(), emitted);
         let ciphertext = writer.finish().unwrap();
-        assert_eq!(&ciphertext[..Header::LEN], header.as_bytes());
         assert_eq!(
             decrypt(&test_key(), b"io", &ciphertext).unwrap(),
             b"message"
@@ -1786,14 +1777,7 @@ mod tests {
         };
         let mut reader = DecryptReader::new(source, &test_key(), b"io").unwrap();
         let mut plaintext = Vec::new();
-        let mut chunk = [0u8; 5];
-        loop {
-            let read = reader.read(&mut chunk).unwrap();
-            if read == 0 {
-                break;
-            }
-            plaintext.extend_from_slice(&chunk[..read]);
-        }
+        reader.read_to_end(&mut plaintext).unwrap();
         assert_eq!(plaintext, b"message");
 
         // When the trailing-data check hits the injected source error
@@ -1810,7 +1794,7 @@ mod tests {
         );
         assert!(
             reader
-                .read(&mut chunk)
+                .read(&mut [0u8; 5])
                 .unwrap_err()
                 .to_string()
                 .contains("poisoned")

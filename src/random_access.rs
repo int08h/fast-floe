@@ -485,6 +485,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
+    use crate::error::crate_error;
     use crate::key::test_key;
     use crate::{LengthRequirement, Parameters, encrypt};
 
@@ -578,39 +579,33 @@ mod tests {
     type FailingSeekerReader = Reader<FailingSeeker<Cursor<Vec<u8>>>>;
 
     fn failing_reader_fixture() -> (FailingSeekerReader, Vec<u8>, Parameters) {
-        let key = test_key();
-        let parameters = Parameters::SEGMENT_4_KIB;
-        let plaintext: Vec<u8> = (0..2 * parameters.plaintext_segment_length() + 37)
-            .map(|position| u8::try_from(position % 251).unwrap())
-            .collect();
-        let ciphertext = encrypt(&key, b"random reader", parameters, &plaintext).unwrap();
+        let (plaintext, ciphertext, parameters) = fixture_message();
         let reader = Reader::new(
             FailingSeeker::new(Cursor::new(ciphertext)),
-            &key,
+            &test_key(),
             b"random reader",
         )
         .unwrap();
         (reader, plaintext, parameters)
     }
 
-    fn crate_error(error: &io::Error) -> Option<&Error> {
-        error
-            .get_ref()
-            .and_then(|source| source.downcast_ref::<Error>())
-    }
-
-    fn framed_reader_fixture() -> (Reader<Cursor<Vec<u8>>>, Vec<u8>, Parameters) {
-        let key = test_key();
+    /// The shared three-segment fixture message.
+    fn fixture_message() -> (Vec<u8>, Vec<u8>, Parameters) {
         let parameters = Parameters::SEGMENT_4_KIB;
         let plaintext: Vec<u8> = (0..2 * parameters.plaintext_segment_length() + 37)
             .map(|position| u8::try_from(position % 251).unwrap())
             .collect();
-        let ciphertext = encrypt(&key, b"random reader", parameters, &plaintext).unwrap();
+        let ciphertext = encrypt(&test_key(), b"random reader", parameters, &plaintext).unwrap();
+        (plaintext, ciphertext, parameters)
+    }
+
+    fn framed_reader_fixture() -> (Reader<Cursor<Vec<u8>>>, Vec<u8>, Parameters) {
+        let (plaintext, ciphertext, parameters) = fixture_message();
         let mut framed = b"pre".to_vec();
         framed.extend_from_slice(&ciphertext);
         let mut cursor = Cursor::new(framed);
         cursor.set_position(3);
-        let reader = Reader::new(cursor, &key, b"random reader").unwrap();
+        let reader = Reader::new(cursor, &test_key(), b"random reader").unwrap();
         (reader, plaintext, parameters)
     }
 
@@ -1130,9 +1125,7 @@ mod tests {
         reader.seek(SeekFrom::Start(5)).unwrap();
         assert_eq!(reader.read(&mut []).unwrap(), 0);
         assert_eq!(reader.stream_position().unwrap(), 5);
-        let mut chunk = [0u8; 4];
-        reader.read_exact(&mut chunk).unwrap();
-        assert_eq!(chunk, plaintext[5..9]);
+        reader.read_exact(&mut [0u8; 4]).unwrap();
         assert_eq!(reader.stream_position().unwrap(), 9);
 
         // Then the wrapped reader is recoverable

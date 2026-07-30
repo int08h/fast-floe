@@ -6,6 +6,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::error::crate_error;
 use crate::key::test_key;
 use crate::low_level::{start_decryption, start_encryption};
 use crate::online::{Decryptor, Encryptor};
@@ -132,9 +133,7 @@ fn ambiguous_keys_fail_from_every_entry_layer() {
         crate::io::EncryptWriter::new(Vec::new(), &key, aad, parameters).unwrap_err();
     assert_eq!(encryption_error.kind(), std::io::ErrorKind::Other);
     assert!(matches!(
-        encryption_error
-            .get_ref()
-            .and_then(|source| source.downcast_ref::<Error>()),
+        crate_error(&encryption_error),
         Some(Error::ProviderSelectionRequired)
     ));
 
@@ -143,9 +142,7 @@ fn ambiguous_keys_fail_from_every_entry_layer() {
             .unwrap_err();
     assert_eq!(decryption_error.kind(), std::io::ErrorKind::InvalidData);
     assert!(matches!(
-        decryption_error
-            .get_ref()
-            .and_then(|source| source.downcast_ref::<Error>()),
+        crate_error(&decryption_error),
         Some(Error::ProviderSelectionRequired)
     ));
 
@@ -153,9 +150,7 @@ fn ambiguous_keys_fail_from_every_entry_layer() {
         crate::random_access::Reader::new(std::io::Cursor::new(ciphertext), &key, aad).unwrap_err();
     assert_eq!(random_access_error.kind(), std::io::ErrorKind::InvalidData);
     assert!(matches!(
-        random_access_error
-            .get_ref()
-            .and_then(|source| source.downcast_ref::<Error>()),
+        crate_error(&random_access_error),
         Some(Error::ProviderSelectionRequired)
     ));
 

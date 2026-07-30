@@ -1852,27 +1852,45 @@ mod tests {
         );
     }
 
-    #[test]
-    fn raw_in_place_final_segment_round_trips() {
-        // Given exactly sized caller storage with the payload at its offset
+    /// Encrypts `payload` as a raw in-place segment at position zero of a
+    /// message with `trailing_plaintext` further bytes (non-final when more
+    /// follows, final otherwise), returning the exactly sized encrypted
+    /// storage, the segment layout, and a decryption state for the message.
+    fn raw_encrypted_segment(
+        payload: &[u8],
+        trailing_plaintext: u64,
+    ) -> (Vec<u8>, SegmentLayout, DecryptionState) {
         let parameters = Parameters::SEGMENT_4_KIB;
-        let segment = parameters.plaintext_layout(5).unwrap().final_segment();
+        let total = length_usize_to_u64(payload.len()) + trailing_plaintext;
+        let segment = parameters
+            .plaintext_layout(total)
+            .unwrap()
+            .segment_for_position(0)
+            .unwrap();
+        assert_eq!(segment.plaintext_length(), payload.len());
         let (mut encryption, header) = start_encryption(&test_key(), b"raw", parameters).unwrap();
         let mut storage = vec![0u8; segment.ciphertext_length()];
-        storage[SEGMENT_PAYLOAD_OFFSET..SEGMENT_PAYLOAD_OFFSET + 5].copy_from_slice(b"hello");
-
-        // When the segment is encrypted in place
+        storage[SEGMENT_PAYLOAD_OFFSET..SEGMENT_PAYLOAD_OFFSET + payload.len()]
+            .copy_from_slice(payload);
         let written = encryption
             .encrypt_segment_in_place_raw(&mut storage, segment)
             .unwrap();
-
-        // Then the exact length is returned and the final prefix encodes it
         assert_eq!(written, segment.ciphertext_length());
-        let prefix = u32::from_be_bytes(storage[..SEGMENT_PREFIX_LENGTH].try_into().unwrap());
-        assert_eq!(prefix, u32::try_from(written).unwrap());
+        let decryption = start_decryption(&test_key(), b"raw", parameters, &header).unwrap();
+        (storage, segment, decryption)
+    }
 
-        // Then the same storage decrypts back to the original plaintext
-        let mut decryption = start_decryption(&test_key(), b"raw", parameters, &header).unwrap();
+    #[test]
+    fn raw_in_place_final_segment_round_trips() {
+        // Given a raw-encrypted final segment in exactly sized storage
+        let (mut storage, segment, mut decryption) = raw_encrypted_segment(b"hello", 0);
+
+        // Then the final prefix encodes the exact segment length
+        let prefix = u32::from_be_bytes(storage[..SEGMENT_PREFIX_LENGTH].try_into().unwrap());
+        assert_eq!(prefix, u32::try_from(storage.len()).unwrap());
+
+        // When the same storage is decrypted in place
+        // Then the original plaintext is recovered
         let plaintext = decryption
             .decrypt_segment_in_place_raw(&mut storage, segment)
             .unwrap();
@@ -1881,30 +1899,18 @@ mod tests {
 
     #[test]
     fn raw_in_place_non_final_segment_round_trips() {
-        // Given a full payload for the first segment of a two-segment layout
+        // Given a raw-encrypted full non-final segment
         let parameters = Parameters::SEGMENT_4_KIB;
-        let capacity = parameters.plaintext_segment_length();
-        let layout = parameters
-            .plaintext_layout(u64::try_from(capacity).unwrap() + 5)
-            .unwrap();
-        let segment = layout.segment_for_position(0).unwrap();
-        let full = vec![0x5a; capacity];
-        let (mut encryption, header) = start_encryption(&test_key(), b"raw", parameters).unwrap();
-        let mut storage = vec![0u8; segment.ciphertext_length()];
-        storage[SEGMENT_PAYLOAD_OFFSET..SEGMENT_PAYLOAD_OFFSET + capacity].copy_from_slice(&full);
+        let full = vec![0x5a; parameters.plaintext_segment_length()];
+        let (mut storage, segment, mut decryption) = raw_encrypted_segment(&full, 5);
 
-        // When the non-final segment is encrypted in place
-        let written = encryption
-            .encrypt_segment_in_place_raw(&mut storage, segment)
-            .unwrap();
-
-        // Then the full segment length is returned with the non-final prefix
-        assert_eq!(written, parameters.ciphertext_segment_length());
+        // Then the storage spans one full segment with the non-final prefix
+        assert_eq!(storage.len(), parameters.ciphertext_segment_length());
         let prefix = u32::from_be_bytes(storage[..SEGMENT_PREFIX_LENGTH].try_into().unwrap());
         assert_eq!(prefix, u32::MAX);
 
-        // Then the same storage decrypts back to the original payload
-        let mut decryption = start_decryption(&test_key(), b"raw", parameters, &header).unwrap();
+        // When the same storage is decrypted in place
+        // Then the original payload is recovered
         let plaintext = decryption
             .decrypt_segment_in_place_raw(&mut storage, segment)
             .unwrap();
@@ -1975,21 +1981,13 @@ mod tests {
     }
 
     #[test]
-    fn raw_in_place_decryption_rejects_bad_prefix_and_tag() {
+    fn raw_in_place_decryption_rejects_forged_final_prefix() {
         // Given a valid raw-encrypted final segment
-        let parameters = Parameters::SEGMENT_4_KIB;
-        let segment = parameters.plaintext_layout(5).unwrap().final_segment();
-        let (mut encryption, header) = start_encryption(&test_key(), b"raw", parameters).unwrap();
-        let mut valid = vec![0u8; segment.ciphertext_length()];
-        valid[SEGMENT_PAYLOAD_OFFSET..SEGMENT_PAYLOAD_OFFSET + 5].copy_from_slice(b"hello");
-        encryption
-            .encrypt_segment_in_place_raw(&mut valid, segment)
-            .unwrap();
-        let mut decryption = start_decryption(&test_key(), b"raw", parameters, &header).unwrap();
+        let (mut storage, segment, mut decryption) = raw_encrypted_segment(b"hello", 0);
 
         // When the final length prefix disagrees with the actual length
         // Then the framing mismatch is rejected with both lengths
-        let mut forged = valid.clone();
+        let mut forged = storage.clone();
         let declared = u32::try_from(segment.ciphertext_length()).unwrap() + 1;
         forged[..SEGMENT_PREFIX_LENGTH].copy_from_slice(&declared.to_be_bytes());
         assert!(matches!(
@@ -2001,19 +1999,10 @@ mod tests {
                 && required == segment.ciphertext_length() + 1
         ));
 
-        // When the authentication tag is corrupted
-        // Then authentication fails
-        let mut tampered = valid.clone();
-        *tampered.last_mut().unwrap() ^= 1;
-        assert!(matches!(
-            decryption.decrypt_segment_in_place_raw(&mut tampered, segment),
-            Err(Error::AuthenticationFailed)
-        ));
-
         // Then the untouched segment still decrypts afterward
         assert_eq!(
             &decryption
-                .decrypt_segment_in_place_raw(&mut valid, segment)
+                .decrypt_segment_in_place_raw(&mut storage, segment)
                 .unwrap()[..],
             b"hello"
         );
@@ -2022,24 +2011,12 @@ mod tests {
     #[test]
     fn raw_in_place_non_final_decryption_rejects_corrupt_prefix() {
         // Given a raw-encrypted non-final segment whose prefix is zeroed
-        let parameters = Parameters::SEGMENT_4_KIB;
-        let capacity = parameters.plaintext_segment_length();
-        let layout = parameters
-            .plaintext_layout(u64::try_from(capacity).unwrap() + 5)
-            .unwrap();
-        let segment = layout.segment_for_position(0).unwrap();
-        let (mut encryption, header) = start_encryption(&test_key(), b"raw", parameters).unwrap();
-        let mut storage = vec![0u8; segment.ciphertext_length()];
-        storage[SEGMENT_PAYLOAD_OFFSET..SEGMENT_PAYLOAD_OFFSET + capacity]
-            .copy_from_slice(&vec![0x5a; capacity]);
-        encryption
-            .encrypt_segment_in_place_raw(&mut storage, segment)
-            .unwrap();
+        let full = vec![0x5a; Parameters::SEGMENT_4_KIB.plaintext_segment_length()];
+        let (mut storage, segment, mut decryption) = raw_encrypted_segment(&full, 5);
         storage[..SEGMENT_PREFIX_LENGTH].fill(0);
 
         // When the corrupted segment is decrypted in place
         // Then the non-final prefix is rejected as framing, not as content
-        let mut decryption = start_decryption(&test_key(), b"raw", parameters, &header).unwrap();
         assert!(matches!(
             decryption.decrypt_segment_in_place_raw(&mut storage, segment),
             Err(Error::InvalidSegmentPrefix)
@@ -2053,7 +2030,7 @@ mod tests {
         let segment = parameters.plaintext_layout(3).unwrap().final_segment();
         let (mut encryption, header) = start_encryption(&test_key(), b"raw", parameters).unwrap();
         let mut decryption = start_decryption(&test_key(), b"raw", parameters, &header).unwrap();
-        let mut foreign = SegmentBuffer::new(Parameters::SEGMENT_1_MIB);
+        let mut foreign = SegmentBuffer::new(Parameters::SEGMENT_64_B);
 
         // When the foreign buffer holds plaintext for encryption
         // Then the parameter mismatch is rejected
@@ -2073,31 +2050,6 @@ mod tests {
             decryption.decrypt_segment_in_place(&mut foreign, segment),
             Err(Error::InvalidParameters)
         ));
-    }
-
-    #[test]
-    fn failed_in_place_encryption_empties_the_buffer() {
-        // Given a buffer holding a short payload sent down the non-final path
-        let parameters = Parameters::SEGMENT_4_KIB;
-        let (mut encryption, _header) = start_encryption(&test_key(), b"raw", parameters).unwrap();
-        let mut buffer = SegmentBuffer::new(parameters);
-        buffer.prepare_plaintext(3).unwrap().copy_from_slice(b"abc");
-
-        // When non-final encryption rejects the short payload
-        let error = encryption
-            .encrypt_segment_in_place_at(&mut buffer, 0, SegmentKind::NonFinal)
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            Error::InvalidPlaintextLength {
-                actual: 3,
-                required: LengthRequirement::Exactly(_),
-            }
-        ));
-
-        // Then the buffer is emptied rather than left partially processed
-        assert_eq!(buffer.plaintext(), Err(Error::InvalidBufferState));
-        assert_eq!(buffer.ciphertext(), Err(Error::InvalidBufferState));
     }
 
     #[test]

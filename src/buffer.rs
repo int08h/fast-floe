@@ -271,12 +271,13 @@ mod tests {
 
     #[test]
     fn prepare_plaintext_rejects_length_above_capacity() {
-        // Given a payload length one byte over the segment capacity
+        // Given a buffer already holding a prepared payload
         let parameters = Parameters::SEGMENT_4_KIB;
         let capacity = parameters.plaintext_segment_length();
         let mut buffer = SegmentBuffer::new(parameters);
+        buffer.prepare_plaintext(3).unwrap().copy_from_slice(b"abc");
 
-        // When the oversized payload is prepared
+        // When a payload one byte over the segment capacity is prepared
         // Then the exact limit is reported
         assert!(matches!(
             buffer.prepare_plaintext(capacity + 1),
@@ -286,19 +287,25 @@ mod tests {
             }) if actual == capacity + 1 && maximum == capacity
         ));
 
-        // Then the rejected preparation leaves nothing readable
-        assert_eq!(buffer.plaintext(), Err(Error::InvalidBufferState));
+        // Then the rejection leaves the previously prepared payload intact
+        assert_eq!(buffer.plaintext().unwrap(), b"abc");
     }
 
     #[test]
     fn prepare_ciphertext_rejects_lengths_outside_segment_bounds() {
-        // Given lengths below the framing overhead and above one segment
+        // Given a buffer holding a minimum-length prepared segment
         let parameters = Parameters::SEGMENT_4_KIB;
         let maximum = parameters.ciphertext_segment_length();
         let mut buffer = SegmentBuffer::new(parameters);
+        assert_eq!(
+            buffer.prepare_ciphertext(SEGMENT_OVERHEAD).unwrap().len(),
+            SEGMENT_OVERHEAD
+        );
 
-        // When each invalid length is prepared
-        // Then the valid range is reported and nothing becomes readable
+        // When lengths below the framing overhead and above one segment
+        // are prepared
+        // Then the valid range is reported and the prior segment stays
+        // prepared
         for length in [SEGMENT_OVERHEAD - 1, maximum + 1] {
             assert!(matches!(
                 buffer.prepare_ciphertext(length),
@@ -310,14 +317,10 @@ mod tests {
                     },
                 }) if actual == length && reported == maximum
             ));
-            assert_eq!(buffer.ciphertext(), Err(Error::InvalidBufferState));
+            assert_eq!(buffer.ciphertext().unwrap().len(), SEGMENT_OVERHEAD);
         }
 
-        // When the boundary lengths are prepared, then both are accepted
-        assert_eq!(
-            buffer.prepare_ciphertext(SEGMENT_OVERHEAD).unwrap().len(),
-            SEGMENT_OVERHEAD
-        );
+        // When the maximum boundary length is prepared, then it is accepted
         assert_eq!(buffer.prepare_ciphertext(maximum).unwrap().len(), maximum);
     }
 
