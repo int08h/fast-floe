@@ -96,8 +96,8 @@ To choose the profile yourself, use `decrypt_with_parameters`.
 
 ### Streams with `std::io`
 
-`EncryptReader` and `DecryptReader` keep memory bounded while composing with
-ordinary Rust I/O:
+`EncryptReader` and `DecryptReader` keep memory bounded. They connect with the
+standard Rust I/O traits:
 
 ```rust
 use std::io::{self, Cursor};
@@ -133,8 +133,9 @@ assert_eq!(plaintext, b"a potentially large input");
 Reading `EncryptReader` to EOF completes encryption. `EncryptWriter` serves
 callers that prefer a `Write` interface.
 
-`DecryptReader::finish` authenticates unread ciphertext and rejects trailing
-bytes. Use `finish_frame` when non-FLOE data follows the FLOE message.
+`DecryptReader::finish` authenticates the unread ciphertext and rejects
+trailing bytes. When non-FLOE data comes after the FLOE message, use
+`finish_frame`.
 
 **IMPORTANT**: Always call `finish` or `try_finish` to complete the FLOE
 message. `flush` will not emit a partial non-final segment, and dropping an
@@ -142,7 +143,7 @@ unfinished writer leaves a truncated message.
 
 ### Authenticated random access
 
-`random_access::Reader` presents a seekable ciphertext as authenticated
+`random_access::Reader` reads a seekable ciphertext and returns authenticated
 plaintext. It implements `Read + Seek` and also reads explicit ranges:
 
 ```rust
@@ -339,15 +340,15 @@ The repository includes two file examples:
 - `serial_file` uses the bounded-memory `std::io` adapters.
 - `manual_file` uses message layouts and low-level segment operations.
 
-Run them with:
+Run the examples with:
 
 ```text
 cargo run --example serial_file -- encrypt INPUT OUTPUT 64_HEX_KEY [4k|1m]
 cargo run --example manual_file -- encrypt INPUT OUTPUT 64_HEX_KEY [4k|1m]
 ```
 
-For a non-default provider, add `--no-default-features --features ring`
-before `--`.
+For a provider that is not the default, add
+`--no-default-features --features ring` before `--`.
 
 Run the default-provider tests and documentation checks with:
 
@@ -358,7 +359,7 @@ cargo clippy --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 
-Run all provider and segment-size benchmarks with:
+Run all provider and segment-length benchmarks with:
 
 ```sh
 ./scripts/bench-matrix.sh
