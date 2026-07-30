@@ -1,42 +1,41 @@
 # fast-floe
 
-`fast-floe` is an optimized, multi-provider, spec-compliant implementation of
-Fast Lightweight Online Encryption (FLOE). FLOE is an authenticated encryption
-scheme for large files and byte streams. It operates with bounded memory and
-gives random access into the ciphertext.
+An optimized, spec-compliant Rust implementation of Fast Lightweight Online
+Encryption (FLOE): authenticated encryption for large files and byte streams,
+with bounded memory, random access and a choice of four cryptography
+providers.
 
 ## Introduction
 
 `fast-floe` implements the [Fast Lightweight Online Encryption (FLOE)
-specification](https://c2sp.org/FLOE) in Rust. FLOE divides a message into
-segments of a length that the caller selects. FLOE encrypts and authenticates
-each segment independently. A recipient can decrypt a large message one segment
-at a time. A recipient can also read and seek to any position in the
-ciphertext.
+specification](https://c2sp.org/FLOE) in Rust. FLOE splits a message into
+segments of a length the caller chooses, then encrypts and authenticates each
+segment independently. A recipient can decrypt a large message one segment at
+a time, or seek directly to any part of the ciphertext.
 
-FLOE is made for very large data, streams with an unknown length, segments that
-arrive out of order, and random access into encrypted data.
+That design suits data too large to hold in memory, streams of unknown
+length, segments that arrive out of order and random access into encrypted
+data.
 
-The caller selects the segment length at encryption time. A smaller segment
-length makes random access less costly. A larger segment length gives more
-throughput.
+The segment length, chosen at encryption time, trades throughput against
+random-access cost: smaller segments make random access cheaper; larger
+segments raise throughput.
 
-The crate supports four cryptography providers: aws-lc-rs, boring, ring, and
-`RustCrypto`. The provider selection does not change the wire format. All
-providers interoperate with each other.
+The crate supports four cryptography providers: aws-lc-rs, boring, ring and
+`RustCrypto`. All four produce the same wire format and interoperate freely.
 
 ## Quick start
 
 Add `fast-floe` from [crates.io](https://crates.io/crates/fast-floe) to
-`Cargo.toml`. In Rust code, the crate name is `fast_floe`.
+`Cargo.toml`. In Rust code the crate is named `fast_floe`.
 
 ```toml
 [dependencies]
 fast-floe = "0.3"
 ```
 
-The default cryptographic provider is aws-lc-rs. To select a different
-provider, refer to the "_Cryptographic providers_" section.
+The default cryptographic provider is aws-lc-rs; the "_Cryptographic
+providers_" section explains how to pick another.
 
 ```rust
 use fast_floe::{Key, Parameters, decrypt, encrypt};
@@ -60,24 +59,24 @@ assert_eq!(recovered, plaintext);
 # }
 ```
 
-`encrypt` returns one complete FLOE message: an authenticated header, then the
-encrypted segments. `decrypt` authenticates the message before it returns the
-plaintext.
+`encrypt` returns one complete FLOE message: an authenticated header followed
+by encrypted segments. `decrypt` authenticates the message before returning
+its plaintext.
 
 The three inputs are:
 
-- `Key`: a 32-byte secret. Use `Key::generate` to make a new random key. Use
-  `Key::from_bytes` to import existing key material.
-- `AAD`: context data that FLOE authenticates with the ciphertext, for example
-  a session ID or a protocol version. FLOE does not store the AAD. Decryption
-  must receive the same AAD bytes.
-- `Parameters`: the encrypted segment length. FLOE supports all segment
-  lengths from 64 through 4,294,967,294 (`u32::MAX` - 2) bytes.
+- `Key`: a 32-byte secret. `Key::generate` creates a random key;
+  `Key::from_bytes` imports existing key material.
+- `AAD`: context that is authenticated with the ciphertext, such as a session
+  ID or protocol version. FLOE does not store the AAD, so decryption must
+  supply the same bytes.
+- `Parameters`: the encrypted segment length. FLOE accepts any length from 64
+  to 4,294,967,294 (`u32::MAX` - 2) bytes.
 
 ## Choose an API
 
-The table lists the APIs from the most simple (high-level) to the most
-advanced (low-level). Use the highest layer that satisfies your needs:
+The APIs below run from simplest to most powerful. Use the highest layer that
+fits:
 
 | Need                                         | API                        | Input                     |
 |----------------------------------------------|----------------------------|---------------------------|
@@ -89,12 +88,11 @@ advanced (low-level). Use the highest layer that satisfies your needs:
 
 ### Whole messages
 
-When the complete input and output fit in memory, use the quick-start
-`encrypt` and `decrypt` functions. The two functions return a new `Vec<u8>`.
+Use the quick-start `encrypt` and `decrypt` functions when the whole input
+and output fit in memory. Both return a new `Vec<u8>`.
 
-`decrypt` reads the authenticated profile (the segment length) from the
-header. If your application must select the profile, use
-`decrypt_with_parameters`.
+`decrypt` takes the profile (segment length) from the authenticated header.
+To choose the profile yourself, use `decrypt_with_parameters`.
 
 ### Streams with `std::io`
 
@@ -132,16 +130,16 @@ assert_eq!(plaintext, b"a potentially large input");
 # }
 ```
 
-Read `EncryptReader` to EOF to complete the encryption. When a `Write`
-interface is a better fit, use `EncryptWriter`.
+Reading `EncryptReader` to EOF completes encryption. `EncryptWriter` serves
+callers that prefer a `Write` interface.
 
 `DecryptReader::finish` authenticates the unread ciphertext and rejects
 trailing bytes. When non-FLOE data comes after the FLOE message, use
 `finish_frame`.
 
 **IMPORTANT**: Always call `finish` or `try_finish` to complete the FLOE
-message. `flush` does not write a partial non-final segment. If you drop an
-unfinished writer, the message stays truncated.
+message. `flush` will not emit a partial non-final segment, and dropping an
+unfinished writer leaves a truncated message.
 
 ### Authenticated random access
 
@@ -172,17 +170,16 @@ assert_eq!(range, plaintext[1_000..1_100]);
 # }
 ```
 
-When you construct a `Reader`, it authenticates the header and the final
-segment. This step establishes the FLOE profile (the segment length) and the
-complete message length. The reader authenticates each requested segment
-before it returns the bytes. Do not change the underlying seekable source
-while the reader is in use. When non-FLOE data comes after the last segment,
-use `Reader::new_with_length`.
+Constructing a `Reader` authenticates the header and final segment, which
+establishes the FLOE profile (segment length) and the total length. The
+reader authenticates each requested segment before returning its bytes. The
+underlying source must not change while the reader is in use. Use
+`Reader::new_with_length` when non-FLOE data follows the last segment.
 
 ### Segment-oriented processing
 
-When your transport already operates on packets, buffers, or other
-segment-like units, use `online::Encryptor` and `online::Decryptor`.
+Use `online::Encryptor` and `online::Decryptor` when your transport already
+deals in packets, buffers or similar units.
 
 ```rust
 use std::io::{Cursor, Read};
@@ -230,20 +227,19 @@ assert_eq!(recovered, plaintext);
 # }
 ```
 
-Each non-final plaintext segment must have exactly
-`parameters.plaintext_segment_length()` bytes. The final segment can be
-shorter or empty. Encryption of the final segment consumes the encryptor. The
-decryptor reads the final marker from each segment and authenticates it.
-`finish` detects a missing final segment, for example a truncated message. If
-the input ends exactly on a segment boundary, the next loop iteration writes
-an empty final segment.
+Every non-final plaintext segment must contain exactly
+`parameters.plaintext_segment_length()` bytes; the final segment may be
+shorter, or empty. Encrypting the final segment consumes the encryptor. The
+decryptor reads and authenticates the final marker in each segment, and
+`finish` detects a missing final segment (that is, truncation). If the input
+ends exactly on a segment boundary, the next loop iteration emits an empty
+final segment.
 
 ### Low-level API
 
 `fast_floe::low_level` exposes the details of the FLOE specification. A
-`MessageLayout` supplies the correct position, length, offset, and finality
-for each segment. When you know the plaintext length in advance, use a
-`MessageLayout`:
+`MessageLayout` supplies the position, length, offset and finality of every
+segment; use one when you know the plaintext length in advance:
 
 ```rust
 use fast_floe::low_level::start_encryption;
@@ -271,56 +267,50 @@ assert_eq!(ciphertext.len() as u64, layout.ciphertext_length());
 # }
 ```
 
-For parallel or concurrent work, call `state.into_shared()`, then call
-`shared.fork()` for each worker or thread. `SharedEncryptionContext` and
+Parallel workloads can call `state.into_shared()`, then `shared.fork()` for
+each worker or thread. `SharedEncryptionContext` and
 `SharedDecryptionContext` are thread-safe (`Send + Sync`).
 
-The low-level API makes the caller responsible for all FLOE invariants:
+The low-level API leaves every FLOE invariant to the caller: process each
+position once, produce exactly one final segment, leave no gaps and process
+nothing after the final segment. Breaking these rules can break the security
+of the message, so prefer the misuse-resistant higher-level APIs.
 
-- Process each position one time.
-- Produce exactly one final segment.
-- Leave no gaps.
-- Process nothing after the final segment.
-
-If you do not obey these rules, the security of the message is not guaranteed.
-When possible, use the misuse-resistant high-level APIs.
-
-`low_level::SegmentBuffer` supplies reusable in-place storage. If you must
-control allocation, use the `*_raw` methods with your own buffer management.
+`low_level::SegmentBuffer` provides reusable in-place storage. Callers that
+manage their own allocation can use the `*_raw` methods with their own
+buffers.
 
 ## Notes
 
-- FLOE authenticates the AAD but does not store it in the ciphertext. Store or
-  derive the AAD separately, and give the same bytes to decryption.
-- The library releases each segment only after the authentication of that
-  segment succeeds. A stream consumer can receive valid early segments before
-  it finds a later corruption or truncation. If your application requires
-  all-or-nothing release, hold the plaintext until finalization.
+- FLOE authenticates the AAD but does not store it in the ciphertext. Store
+  or derive it separately and reproduce it exactly.
+- The library releases each segment only after that segment authenticates. A
+  stream consumer can therefore receive valid early segments before
+  discovering later corruption or truncation. Applications that need
+  all-or-nothing release must hold plaintext until finalization.
 - Segment prefixes and layout calculations describe framing only. Treat them
-  as untrusted data until the related header or segment authenticates.
+  as untrusted until the corresponding header or segment authenticates.
 
 ## Segment sizes
 
-FLOE supports all segment lengths from 64 through 4,294,967,294
-(`u32::MAX` - 2) bytes. Each length in this range is valid, including odd
-lengths and lengths that are not powers of 2. The constant
-`Parameters::VALID_SEGMENT_LENGTHS` encodes this range.
+FLOE accepts any segment length from 64 to 4,294,967,294 (`u32::MAX` - 2)
+bytes, inclusive, including odd lengths and lengths that are not powers of
+two. The constant `Parameters::VALID_SEGMENT_LENGTHS` encodes this range.
 
-Use `Parameters::from_segment_length()` to construct `Parameters` with your
-selected length. Or use one of the `Parameters::SEGMENT_*` constants.
+Construct `Parameters` with `Parameters::from_segment_length()`, or use one
+of the `Parameters::SEGMENT_*` constants.
 
-Only the encrypted segment length changes. All other FLOE parameters
-(AES-256-GCM, HKDF-SHA-384, IV length) stay the same.
+Only the encrypted segment length varies; the other FLOE parameters
+(AES-256-GCM, HKDF-SHA-384, IV length) are fixed.
 
-`Parameters::plaintext_layout` and `Parameters::ciphertext_layout` calculate a
-complete `random_access::MessageLayout`. Use them for storage sizing and
+`Parameters::plaintext_layout` and `Parameters::ciphertext_layout` calculate
+a complete `random_access::MessageLayout`. Use them for storage sizing and
 manual segment processing.
 
 ## Cryptographic providers
 
-The crate uses external providers for AES-256-GCM, HKDF-SHA-384, and
-random-number generation. The default provider is `aws-lc-rs`. The crate
-supports these providers:
+The crate delegates AES-256-GCM, HKDF-SHA-384 and random-number generation
+to one of four providers. The default is `aws-lc-rs`:
 
 | Feature               | Provider crate(s)                                                                                                 |
 |-----------------------|-------------------------------------------------------------------------------------------------------------------|
@@ -329,19 +319,19 @@ supports these providers:
 | `ring`                | [ring](https://crates.io/crates/ring)                                                                             |
 | `rustcrypto`          | `RustCrypto` [aes-gcm](https://crates.io/crates/aes-gcm) and [rand_chacha](https://crates.io/crates/rand_chacha/) |
 
-The provider selection does not change the FLOE wire format. All providers are
-compatible with each other.
+Provider choice does not change the FLOE wire format; ciphertext from any
+provider decrypts with any other.
 
-To use a different provider:
+To use another provider:
 
 ```toml
 fast-floe = { version = "0.3", default-features = false, features = ["ring"] }
 ```
 
-Provider features are additive. When you compile exactly one provider,
-`Key::generate` and `Key::from_bytes` use that provider automatically. When
-you compile more than one provider, bind one provider to the key with
-`Key::generate_with_provider` or `Key::from_bytes_with_provider`.
+Provider features are additive. With exactly one provider compiled,
+`Key::generate` and `Key::from_bytes` use it automatically. With several,
+bind one to the key with `Key::generate_with_provider` or
+`Key::from_bytes_with_provider`.
 
 ## Examples and development
 
@@ -360,7 +350,7 @@ cargo run --example manual_file -- encrypt INPUT OUTPUT 64_HEX_KEY [4k|1m]
 For a provider that is not the default, add
 `--no-default-features --features ring` before `--`.
 
-Run the default-provider tests and the documentation checks with:
+Run the default-provider tests and documentation checks with:
 
 ```sh
 cargo test --all-targets
@@ -377,14 +367,14 @@ Run all provider and segment-length benchmarks with:
 
 ### Benchmark results
 
-The tables show the median throughput in GiB/s. Each provider is compiled
-alone with `-C target-cpu=native` and one codegen unit. Each benchmark makes
-its buffer at least 4x the size of the detected last-level cache. This size
-makes sure that the benchmark measures memory, not the cache.
+Median throughput in GiB/s, with each provider compiled alone with
+`-C target-cpu=native` and a single codegen unit. Each benchmark sizes its
+buffer to at least four times the detected last-level cache, so the run
+measures memory, not the cache.
 
-The "into" columns encrypt or decrypt into a separate output buffer. When the
-provider supports it, these operations use scatter/gather. The "in place"
-columns overwrite the input.
+The "into" columns encrypt or decrypt into a separate output buffer (with
+scatter/gather where the provider supports it); the "in place" columns
+overwrite their input.
 
 #### AMD Zen 5 9950X (VAES, AVX-512), Rust 1.97.1
 
@@ -401,14 +391,13 @@ FLOE segment-oriented performance in GiB/sec, higher is better
 | `ring`       | 4 KiB    |         5.99 |             9.15 |         6.91 |            10.31 |
 | `rustcrypto` | 4 KiB    |         4.67 |             4.84 |         4.81 |             4.59 |
 
-The next lines compare FLOE "in place" with "bare" AES-256-GCM from each
-provider on the Zen 5. With 1 MiB segments, `aws-lc-rs`, `ring`, and
-`rustcrypto` are within approximately 5%, and `boring` is approximately 12%
-slower. With 4 KiB segments, FLOE is approximately 5% to 45% slower.
+Against each provider's bare AES-256-GCM, FLOE "in place" on the Zen 5 comes
+within about 5% on 1 MiB segments for `aws-lc-rs`, `ring` and `rustcrypto`
+(`boring` is about 12% slower), and runs 5-45% slower on 4 KiB segments.
 
 The `std::io` adapters and the random-access reader add overhead to the
-segment operations above. The `Reader` operates on whole segments without a
-copy. Reads that are smaller than one segment are buffered (one copy).
+segment operations above. The `Reader` handles whole segments without
+copying; reads smaller than a segment are buffered, at the cost of one copy.
 
 | Provider     | Segments | `EncryptWriter` | `EncryptReader` | `DecryptReader` | Reader (seq) | Reader (range) |
 |--------------|----------|--------------:|--------------:|--------------:|-------------:|---------------:|
@@ -436,12 +425,11 @@ FLOE segment-oriented performance in GiB/sec, higher is better.
 | `ring`       | 4 KiB    |         5.43 |             6.16 |         5.80 |             6.40 |
 | `rustcrypto` | 4 KiB    |         5.54 |             5.50 |         5.59 |             5.56 |
 
-The next lines compare FLOE "in place" with "bare" AES-256-GCM from each
-provider on the M3. With 1 MiB segments, FLOE is within approximately 1%.
-With 4 KiB segments, FLOE is approximately 3% to 15% slower.
+Against each provider's bare AES-256-GCM, FLOE "in place" on the M3 comes
+within about 1% on 1 MiB segments and runs 3-15% slower on 4 KiB segments.
 
-The next table shows the `std::io` adapter and random-access reader results
-on the M3, measured in the same way as the Zen 5 tables:
+The `std::io` adapter and random-access reader results on the M3, measured as
+for the Zen 5:
 
 | Provider     | Segments | `EncryptWriter` | `EncryptReader` | `DecryptReader` | Reader (seq) | Reader (range) |
 |--------------|----------|--------------:|--------------:|--------------:|-------------:|---------------:|
