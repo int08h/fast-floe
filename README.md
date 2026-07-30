@@ -381,7 +381,7 @@ FLOE segment-oriented performance in GiB/sec, higher is better
 | `ring`       | 4 KiB    |         5.99 |             9.15 |         6.91 |            10.31 |
 | `rustcrypto` | 4 KiB    |         4.67 |             4.84 |         4.81 |             4.59 |
 
-Compared to "bare" AES-256-GCM from each provider, FLOE "in_place" on Zen5 is within ~5% on
+Compared to "bare" AES-256-GCM from each provider, FLOE "`in_place`" on Zen5 is within ~5% on
 1 MiB segments for `aws-lc-rs`, `ring`, and `rustcrypto` (`boring` is ~12% slower), and
 roughly 5%-45% slower on 4 KiB segments.
 
@@ -389,7 +389,7 @@ The `std::io` adapters and the random-access reader have additional overhead on 
 operations above. The `Reader`'s operate on whole-segments which are copy-free. Sub-segment 
 sized reads are buffered (one copy). 
 
-| Provider     | Segments | EncryptWriter | EncryptReader | DecryptReader | Reader (seq) | Reader (range) |
+| Provider     | Segments | `EncryptWriter` | `EncryptReader` | `DecryptReader` | Reader (seq) | Reader (range) |
 |--------------|----------|--------------:|--------------:|--------------:|-------------:|---------------:|
 | `aws-lc-rs`  | 1 MiB    |         18.07 |         13.79 |         12.35 |        10.85 |           9.48 |
 | `boring`     | 1 MiB    |         16.62 |         13.27 |         10.22 |        10.56 |           6.96 |
@@ -421,7 +421,7 @@ on 1 MiB segments and roughly 3%-15% slower on 4 KiB segments.
 The `std::io` adapter and random-access reader results on the M3, measured the same way as
 the Zen 5 table above:
 
-| Provider     | Segments | EncryptWriter | EncryptReader | DecryptReader | Reader (seq) | Reader (range) |
+| Provider     | Segments | `EncryptWriter` | `EncryptReader` | `DecryptReader` | Reader (seq) | Reader (range) |
 |--------------|----------|--------------:|--------------:|--------------:|-------------:|---------------:|
 | `aws-lc-rs`  | 1 MiB    |          8.33 |          7.34 |          7.14 |         6.52 |           6.98 |
 | `boring`     | 1 MiB    |          6.89 |          6.23 |          5.48 |         5.56 |           5.60 |
