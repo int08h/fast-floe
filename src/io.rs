@@ -832,7 +832,7 @@ fn poisoned_error() -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Cursor, Read as _, Write as _};
+    use std::io::Cursor;
 
     use super::*;
     use crate::error::crate_error;
