@@ -71,7 +71,7 @@ The three inputs are:
   ID or protocol version. FLOE does not store the AAD, so decryption must
   supply the same bytes.
 - `Parameters`: the encrypted segment length. FLOE accepts any length from 64
-  to 4,294,967,294 (`u32::MAX` - 2) bytes.
+  to 4,294,967,294 (`u32::MAX` - 1) bytes.
 
 ## Choose an API
 
@@ -83,8 +83,8 @@ fits:
 | Encrypt or decrypt bytes already in memory   | `encrypt`, `decrypt`       | One-shot complete message |
 | Process a file, socket, or `std::io` adapter | `fast_floe::io`            | `Read` or `Write`         |
 | Read selected authenticated ranges           | `fast_floe::random_access` | `Read + Seek` ciphertext  |
-| Exchange segments, possibly out-of-order     | `fast_floe::online`        | Streaming data            |
-| Process segments manually or in parallel     | `fast_floe::low_level`     | Experts needing control   |
+| Exchange segments strictly in order          | `fast_floe::online`        | Streaming data            |
+| Process segments manually, in parallel, or out of order | `fast_floe::low_level` | Experts needing control |
 
 ### Whole messages
 
@@ -179,7 +179,9 @@ underlying source must not change while the reader is in use. Use
 ### Segment-oriented processing
 
 Use `online::Encryptor` and `online::Decryptor` when your transport already
-deals in packets, buffers or similar units.
+deals in packets, buffers or similar units. Both process segments strictly
+in order, so the transport must preserve segment order; for out-of-order or
+parallel segment processing, use `fast_floe::low_level`.
 
 ```rust
 use std::io::{Cursor, Read};
@@ -291,9 +293,35 @@ buffers.
 - Segment prefixes and layout calculations describe framing only. Treat them
   as untrusted until the corresponding header or segment authenticates.
 
+## Handling errors from the `std::io` adapters
+
+The `io` and `random_access` adapters report FLOE failures as `io::Error`
+values with the crate `Error` attached as the source. Use
+`Error::io_source` to separate FLOE failures, such as tampering, from
+ordinary I/O errors:
+
+```rust
+use std::io::Read;
+
+use fast_floe::io::DecryptReader;
+use fast_floe::Error;
+
+fn read_message(reader: &mut DecryptReader<impl Read>) -> std::io::Result<Vec<u8>> {
+    let mut plaintext = Vec::new();
+    if let Err(error) = reader.read_to_end(&mut plaintext) {
+        if let Some(Error::AuthenticationFailed) = Error::io_source(&error) {
+            eprintln!("ciphertext is corrupted or was tampered with");
+        }
+        return Err(error);
+    }
+    reader.try_finish()?;
+    Ok(plaintext)
+}
+```
+
 ## Segment sizes
 
-FLOE accepts any segment length from 64 to 4,294,967,294 (`u32::MAX` - 2)
+FLOE accepts any segment length from 64 to 4,294,967,294 (`u32::MAX` - 1)
 bytes, inclusive, including odd lengths and lengths that are not powers of
 two. The constant `Parameters::VALID_SEGMENT_LENGTHS` encodes this range.
 
@@ -355,7 +383,7 @@ Run the default-provider tests and documentation checks with:
 ```sh
 cargo test --all-targets
 cargo test --doc
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 

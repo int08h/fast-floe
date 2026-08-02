@@ -406,14 +406,9 @@ impl SegmentFraming {
 }
 
 impl Parameters {
-    /// Range valid of FLOE segment sizes in bytes. FLOE accepts _any_ segment size
+    /// Range of valid FLOE segment sizes in bytes. FLOE accepts _any_ segment size
     /// in this range and is not restricted to powers of 2.
-    #[cfg(not(test))]
-    pub const VALID_SEGMENT_LENGTHS: Range<u32> = 64..(u32::MAX - 1);
-
-    /// Test-only segment-size range that includes the spec's 40-byte KATs.
-    #[cfg(test)]
-    pub const VALID_SEGMENT_LENGTHS: Range<u32> = 40..(u32::MAX - 1);
+    pub const VALID_SEGMENT_LENGTHS: Range<u32> = 64..u32::MAX;
 
     /// FLOE with 64-byte encrypted segments.
     pub const SEGMENT_64_B: Self = Self::from_segment_length_unchecked(64);
@@ -441,11 +436,13 @@ impl Parameters {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidParameters`] when `segment_len` is outside the
-    /// supported range.
+    /// Returns [`Error::InvalidSegmentLength`] when `segment_len` is outside
+    /// the supported range.
     pub fn from_segment_length(segment_len: u32) -> Result<Self> {
         if !Self::VALID_SEGMENT_LENGTHS.contains(&segment_len) {
-            return Err(Error::InvalidParameters);
+            return Err(Error::InvalidSegmentLength {
+                actual: segment_len,
+            });
         }
 
         Ok(Self::from_segment_length_unchecked(segment_len))
@@ -459,14 +456,13 @@ impl Parameters {
         }
     }
 
+    /// Skips segment-length validation: the specification's key-rotation KATs
+    /// use 40-byte segments, below [`Self::VALID_SEGMENT_LENGTHS`].
     #[cfg(test)]
-    pub(crate) fn with_rotation_mask_for_test(
-        segment_len: u32,
-        rotation_mask: u64,
-    ) -> Result<Self> {
-        let mut parameters = Self::from_segment_length(segment_len)?;
+    pub(crate) fn with_rotation_mask_for_test(segment_len: u32, rotation_mask: u64) -> Self {
+        let mut parameters = Self::from_segment_length_unchecked(segment_len);
         parameters.rotation_mask = rotation_mask;
-        Ok(parameters)
+        parameters
     }
 
     /// Returns the exact length of every non-final ciphertext segment.
@@ -629,7 +625,8 @@ impl Parameters {
         seg_len_bytes.copy_from_slice(&encoded[2..6]);
 
         let segment_length = u32::from_be_bytes(seg_len_bytes);
-        let parameters = Self::from_segment_length(segment_length)?;
+        let parameters = Self::from_segment_length(segment_length)
+            .map_err(|_| Error::InvalidHeaderParameters)?;
 
         if parameters.encode() == encoded {
             Ok(parameters)
@@ -718,22 +715,49 @@ mod tests {
         let valid_range = Parameters::VALID_SEGMENT_LENGTHS;
         let first_valid = valid_range.start;
 
-        for segment_length in [0, first_valid - 1, valid_range.end, u32::MAX] {
+        // valid_range.end is u32::MAX, the non-final segment marker
+        for segment_length in [0, first_valid - 1, valid_range.end] {
             assert!(!valid_range.contains(&segment_length));
 
             // When parameters are constructed from the segment length
-            // Then construction is rejected
+            // Then construction is rejected with the offending value
             assert_eq!(
                 Parameters::from_segment_length(segment_length),
-                Err(Error::InvalidParameters)
+                Err(Error::InvalidSegmentLength {
+                    actual: segment_length
+                })
             );
 
             // When the length is spliced into an otherwise valid encoding
-            // Then decoding is rejected as well
+            // Then decoding is rejected as a header-parameter problem
             let mut encoded = Parameters::SEGMENT_4_KIB.encode();
             encoded[2..6].copy_from_slice(&segment_length.to_be_bytes());
-            assert!(Parameters::decode(encoded).is_err());
+            assert_eq!(
+                Parameters::decode(encoded),
+                Err(Error::InvalidHeaderParameters)
+            );
         }
+    }
+
+    #[test]
+    fn invalid_segment_length_error_names_the_value_and_bounds() {
+        // Given a segment length below the supported minimum
+        let error = Parameters::from_segment_length(63).unwrap_err();
+
+        // Then the error carries the value and its message states the value
+        // and the supported bounds, not a parameter-set mismatch
+        assert_eq!(error, Error::InvalidSegmentLength { actual: 63 });
+        let message = error.to_string();
+        assert!(message.contains("63"), "missing value: {message}");
+        assert!(message.contains("64"), "missing minimum: {message}");
+        assert!(
+            message.contains((u32::MAX - 1).to_string().as_str()),
+            "missing maximum: {message}"
+        );
+        assert!(
+            !message.contains("do not match"),
+            "reads as a mismatch: {message}"
+        );
     }
 
     #[test]

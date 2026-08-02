@@ -15,7 +15,8 @@ use crate::wire::{
 };
 use crate::{
     DecryptionState, Error, HEADER_LENGTH_U64, Header, Key, Parameters, SegmentBuffer,
-    length_u64_to_usize_saturating, length_usize_to_u64, start_decryption_inferred,
+    length_u64_to_usize_saturating, length_usize_to_u64, start_decryption,
+    start_decryption_inferred,
 };
 
 /// Authenticated random-access reader for a complete seekable FLOE ciphertext.
@@ -25,7 +26,7 @@ use crate::{
 /// is used. Both the header and final segment are authenticated before
 /// exposing the message content.
 ///
-/// The underlying `Reader` must not change while this reader is in use.
+/// The underlying source must not change while this reader is in use.
 #[derive(Debug)]
 pub struct Reader<R> {
     inner: R,
@@ -48,11 +49,41 @@ impl<R: Read + Seek> Reader<R> {
     /// # Errors
     ///
     /// Returns an error for seek/read failures, an invalid or unauthenticated
-    /// header, or an impossible complete ciphertext length.
+    /// header, an impossible complete ciphertext length, or a final segment
+    /// that fails authentication (the final segment is authenticated during
+    /// construction).
     pub fn new(mut inner: R, key: &Key, aad: &[u8]) -> io::Result<Self> {
         let message_start = inner.stream_position()?;
         let header = read_header(&mut inner)?;
         let state = start_decryption_inferred(key, aad, &header).map_err(decryption_error)?;
+        let ciphertext_length = remaining_length(&mut inner, message_start)?;
+        Self::from_parts(inner, state, header, message_start, ciphertext_length)
+    }
+
+    /// Opens a seekable ciphertext, requiring its header to declare
+    /// `parameters`.
+    ///
+    /// Use this constructor to enforce a segment-length policy: construction
+    /// fails before any payload is produced when the authenticated header does
+    /// not declare `parameters`. [`Self::new`] instead adopts the header's
+    /// parameters.
+    ///
+    /// # Errors
+    ///
+    /// In addition to the [`Self::new`] errors, returns an error when the
+    /// header declares a parameter set other than `parameters`
+    /// ([`Error::InvalidHeaderParameters`]).
+    ///
+    /// [`Error::InvalidHeaderParameters`]: crate::Error::InvalidHeaderParameters
+    pub fn new_with_parameters(
+        mut inner: R,
+        key: &Key,
+        aad: &[u8],
+        parameters: Parameters,
+    ) -> io::Result<Self> {
+        let message_start = inner.stream_position()?;
+        let header = read_header(&mut inner)?;
+        let state = start_decryption(key, aad, parameters, &header).map_err(decryption_error)?;
         let ciphertext_length = remaining_length(&mut inner, message_start)?;
         Self::from_parts(inner, state, header, message_start, ciphertext_length)
     }
@@ -66,7 +97,9 @@ impl<R: Read + Seek> Reader<R> {
     /// # Errors
     ///
     /// Returns an error for invalid bounds, seek/read failures, an invalid or
-    /// unauthenticated header, or a final segment inconsistent with the bound.
+    /// unauthenticated header, a final segment inconsistent with the bound,
+    /// or a final segment that fails authentication (the final segment is
+    /// authenticated during construction).
     pub fn new_with_length(
         mut inner: R,
         key: &Key,
@@ -77,6 +110,33 @@ impl<R: Read + Seek> Reader<R> {
         let message_start = inner.stream_position()?;
         let header = read_header(&mut inner)?;
         let state = start_decryption_inferred(key, aad, &header).map_err(decryption_error)?;
+        Self::from_parts(inner, state, header, message_start, ciphertext_length)
+    }
+
+    /// Opens a ciphertext with an explicit length, requiring its header to
+    /// declare `parameters`.
+    ///
+    /// Combines the explicit bound of [`Self::new_with_length`] with the
+    /// parameter policy of [`Self::new_with_parameters`].
+    ///
+    /// # Errors
+    ///
+    /// In addition to the [`Self::new_with_length`] errors, returns an error
+    /// when the header declares a parameter set other than `parameters`
+    /// ([`Error::InvalidHeaderParameters`]).
+    ///
+    /// [`Error::InvalidHeaderParameters`]: crate::Error::InvalidHeaderParameters
+    pub fn new_with_length_and_parameters(
+        mut inner: R,
+        key: &Key,
+        aad: &[u8],
+        ciphertext_length: u64,
+        parameters: Parameters,
+    ) -> io::Result<Self> {
+        validate_header_bound(ciphertext_length)?;
+        let message_start = inner.stream_position()?;
+        let header = read_header(&mut inner)?;
+        let state = start_decryption(key, aad, parameters, &header).map_err(decryption_error)?;
         Self::from_parts(inner, state, header, message_start, ciphertext_length)
     }
 
@@ -485,7 +545,6 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::error::crate_error;
     use crate::key::test_key;
     use crate::{LengthRequirement, Parameters, encrypt};
 
@@ -960,7 +1019,7 @@ mod tests {
         // Then the exact shortfall is classified as invalid input
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(matches!(
-            crate_error(&error),
+            Error::io_source(&error),
             Some(Error::OutputTooSmall {
                 actual: 9,
                 required: 10,
@@ -1025,7 +1084,10 @@ mod tests {
             reader.read_range(0..=u64::MAX).unwrap_err(),
         ] {
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-            assert!(matches!(crate_error(&error), Some(Error::LengthOverflow)));
+            assert!(matches!(
+                Error::io_source(&error),
+                Some(Error::LengthOverflow)
+            ));
         }
     }
 
@@ -1074,7 +1136,7 @@ mod tests {
         // Then the short read is classified with both exact lengths
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(matches!(
-            crate_error(&error),
+            Error::io_source(&error),
             Some(Error::InvalidCiphertextLength {
                 actual: 100,
                 required: LengthRequirement::Exactly(required),

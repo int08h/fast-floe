@@ -37,6 +37,9 @@ pub enum Error {
     InvalidKeyLength { actual: usize },
     /// An operation combined values from different FLOE parameter sets.
     InvalidParameters,
+    /// A segment length was outside
+    /// [`Parameters::VALID_SEGMENT_LENGTHS`](crate::Parameters::VALID_SEGMENT_LENGTHS).
+    InvalidSegmentLength { actual: u32 },
     /// A plaintext segment did not meet its required length.
     InvalidPlaintextLength {
         actual: usize,
@@ -86,6 +89,15 @@ impl fmt::Display for Error {
                 write!(f, "FLOE keys must be 32 bytes, got {actual}")
             }
             Self::InvalidParameters => f.write_str("FLOE parameter sets do not match"),
+            Self::InvalidSegmentLength { actual } => {
+                let supported = crate::Parameters::VALID_SEGMENT_LENGTHS;
+                write!(
+                    f,
+                    "invalid FLOE segment length {actual}; supported lengths are {} through {}",
+                    supported.start,
+                    supported.end - 1
+                )
+            }
             Self::InvalidPlaintextLength { actual, required } => write!(
                 f,
                 "invalid plaintext segment length {actual}; required {required}"
@@ -141,10 +153,29 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Returns the crate error carried as a wrapped `io::Error` source.
-#[cfg(test)]
-pub(crate) fn crate_error(error: &std::io::Error) -> Option<&Error> {
-    error
-        .get_ref()
-        .and_then(|source| source.downcast_ref::<Error>())
+impl Error {
+    /// Returns the [`Error`] carried as the source of a wrapped
+    /// [`std::io::Error`].
+    ///
+    /// The [`crate::io`] and [`crate::random_access`] adapters report FLOE
+    /// failures as `io::Error` values with the original [`Error`] attached as
+    /// the source. Use this helper to distinguish authentication, truncation,
+    /// and policy failures from ordinary I/O errors:
+    ///
+    /// ```
+    /// use fast_floe::Error;
+    ///
+    /// fn is_tampered(error: &std::io::Error) -> bool {
+    ///     matches!(Error::io_source(error), Some(Error::AuthenticationFailed))
+    /// }
+    /// ```
+    ///
+    /// Returns `None` for errors that did not originate in this crate, such
+    /// as failures of the wrapped reader or writer.
+    #[must_use]
+    pub fn io_source(error: &std::io::Error) -> Option<&Self> {
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<Self>())
+    }
 }

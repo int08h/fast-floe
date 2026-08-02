@@ -6,7 +6,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::error::crate_error;
 use crate::key::test_key;
 use crate::low_level::{start_decryption, start_encryption};
 use crate::online::{Decryptor, Encryptor};
@@ -133,7 +132,7 @@ fn ambiguous_keys_fail_from_every_entry_layer() {
         crate::io::EncryptWriter::new(Vec::new(), &key, aad, parameters).unwrap_err();
     assert_eq!(encryption_error.kind(), std::io::ErrorKind::Other);
     assert!(matches!(
-        crate_error(&encryption_error),
+        Error::io_source(&encryption_error),
         Some(Error::ProviderSelectionRequired)
     ));
 
@@ -142,7 +141,7 @@ fn ambiguous_keys_fail_from_every_entry_layer() {
             .unwrap_err();
     assert_eq!(decryption_error.kind(), std::io::ErrorKind::InvalidData);
     assert!(matches!(
-        crate_error(&decryption_error),
+        Error::io_source(&decryption_error),
         Some(Error::ProviderSelectionRequired)
     ));
 
@@ -150,7 +149,7 @@ fn ambiguous_keys_fail_from_every_entry_layer() {
         crate::random_access::Reader::new(std::io::Cursor::new(ciphertext), &key, aad).unwrap_err();
     assert_eq!(random_access_error.kind(), std::io::ErrorKind::InvalidData);
     assert!(matches!(
-        crate_error(&random_access_error),
+        Error::io_source(&random_access_error),
         Some(Error::ProviderSelectionRequired)
     ));
 
@@ -218,7 +217,7 @@ fn every_kat_decrypts() {
         } else if name.ends_with("GCM256_IV256_64") {
             Parameters::SEGMENT_64_B
         } else if name.ends_with("rotation") {
-            Parameters::with_rotation_mask_for_test(40, !3).unwrap()
+            Parameters::with_rotation_mask_for_test(40, !3)
         } else {
             panic!("unrecognized KAT {name}");
         };
