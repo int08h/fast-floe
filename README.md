@@ -78,13 +78,13 @@ The three inputs are:
 The APIs below run from simplest to most powerful. Use the highest layer that
 fits:
 
-| Need                                         | API                        | Input                     |
-|----------------------------------------------|----------------------------|---------------------------|
-| Encrypt or decrypt bytes already in memory   | `encrypt`, `decrypt`       | One-shot complete message |
-| Process a file, socket, or `std::io` adapter | `fast_floe::io`            | `Read` or `Write`         |
-| Read selected authenticated ranges           | `fast_floe::random_access` | `Read + Seek` ciphertext  |
-| Exchange segments strictly in order          | `fast_floe::online`        | Streaming data            |
-| Process segments manually, in parallel, or out of order | `fast_floe::low_level` | Experts needing control |
+| Need                                          | API                        | Input                     |
+|-----------------------------------------------|----------------------------|---------------------------|
+| Encrypt or decrypt bytes already in memory    | `encrypt`, `decrypt`       | One-shot complete message |
+| Process a file, socket, or `std::io` adapter  | `fast_floe::io`            | `Read` or `Write`         |
+| Read selected authenticated ranges            | `fast_floe::random_access` | `Read + Seek` ciphertext  |
+| Exchange segments in order                    | `fast_floe::online`        | Streaming data            |
+| Process segments in parallel, or out of order | `fast_floe::low_level`     | Experts needing control   |
 
 ### Whole messages
 

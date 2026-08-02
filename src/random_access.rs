@@ -63,10 +63,9 @@ impl<R: Read + Seek> Reader<R> {
     /// Opens a seekable ciphertext, requiring its header to declare
     /// `parameters`.
     ///
-    /// Use this constructor to enforce a segment-length policy: construction
+    /// Use this constructor to enforce a segment length: construction
     /// fails before any payload is produced when the authenticated header does
-    /// not declare `parameters`. [`Self::new`] instead adopts the header's
-    /// parameters.
+    /// not match `parameters`. 
     ///
     /// # Errors
     ///
@@ -117,7 +116,7 @@ impl<R: Read + Seek> Reader<R> {
     /// declare `parameters`.
     ///
     /// Combines the explicit bound of [`Self::new_with_length`] with the
-    /// parameter policy of [`Self::new_with_parameters`].
+    /// parameters of [`Self::new_with_parameters`].
     ///
     /// # Errors
     ///
@@ -804,7 +803,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::reversed_empty_ranges)] // deliberately invalid range input
-    fn rejects_invalid_ranges_and_supports_a_parameter_policy_check() {
+    fn rejects_invalid_ranges_and_supports_a_parameter_check() {
         // Given a reader over a single-segment message
         let key = test_key();
         let ciphertext = encrypt(
@@ -816,7 +815,7 @@ mod tests {
         .unwrap();
         let mut reader = Reader::new(Cursor::new(ciphertext), &key, b"random reader").unwrap();
 
-        // Then the authenticated parameters are available for a policy check
+        // Then the authenticated parameters are available
         assert_ne!(reader.parameters(), Parameters::SEGMENT_1_MIB);
 
         // When a range beyond the plaintext or a reversed range is read

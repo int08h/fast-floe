@@ -1,16 +1,13 @@
 #![forbid(unsafe_code)]
 #![doc = include_str!("../README.md")]
-// With no provider selected, only the targeted compile_error in `backends`
-// should reach the user; suppress the follow-on unused-item noise.
-#![cfg_attr(
-    not(any(
-        feature = "aws-lc-rs",
-        feature = "boring",
-        feature = "ring",
-        feature = "rustcrypto"
-    )),
-    allow(unused)
-)]
+
+#[cfg(not(any(
+    feature = "rustcrypto",
+    feature = "aws-lc-rs",
+    feature = "boring",
+    feature = "ring"
+)))]
+compile_error!("enable at least one FLOE provider: aws-lc-rs, boring, ring, or rustcrypto");
 
 mod backends;
 mod buffer;

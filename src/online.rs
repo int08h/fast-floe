@@ -334,10 +334,9 @@ impl Decryptor {
 
     /// Creates a decryptor that requires the header to declare `parameters`.
     ///
-    /// Use this constructor to enforce a segment-length policy: construction
+    /// Use this constructor to enforce a segment length: construction
     /// fails before any payload is produced when the authenticated header does
-    /// not declare `parameters`. [`Self::new`] instead adopts the header's
-    /// parameters.
+    /// not match `parameters`.
     ///
     /// # Errors
     ///

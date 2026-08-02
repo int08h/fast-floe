@@ -28,8 +28,7 @@ fn segment_aad(position: u64, kind: SegmentKind) -> [u8; SEGMENT_AAD_LENGTH] {
 
 /// A complete fixed-size FLOE header.
 ///
-/// Use [`Self::unverified_parameters`] only for selecting policy or preparing
-/// buffers. The encoded parameters are not authenticated until decryption
+/// The encoded parameters are not authenticated until decryption
 /// initialization succeeds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Header([u8; HEADER_LENGTH]);

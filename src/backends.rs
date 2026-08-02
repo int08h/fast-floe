@@ -1,11 +1,3 @@
-#[cfg(not(any(
-    feature = "rustcrypto",
-    feature = "aws-lc-rs",
-    feature = "boring",
-    feature = "ring"
-)))]
-compile_error!("enable at least one FLOE provider: aws-lc-rs, boring, ring, or rustcrypto");
-
 use crate::provider::ProviderKind;
 use crate::{Provider, Result};
 
