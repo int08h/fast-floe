@@ -65,7 +65,7 @@ impl<R: Read + Seek> Reader<R> {
     ///
     /// Use this constructor to enforce a segment length: construction
     /// fails before any payload is produced when the authenticated header does
-    /// not match `parameters`. 
+    /// not match `parameters`.
     ///
     /// # Errors
     ///

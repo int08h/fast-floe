@@ -44,7 +44,7 @@ use fast_floe::{Key, Parameters, decrypt, encrypt};
 let key = Key::generate()?;
 let aad = b"tenant=acme;object=backup";
 let plaintext = b"data to protect";
-let params = Parameters::from_segment_length(1_000_000)?;
+let params = Parameters::with_segment_length(1_000_000)?;
 
 let ciphertext = encrypt(
     &key,
@@ -108,7 +108,7 @@ use fast_floe::{Key, Parameters};
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let key = Key::from_bytes([0x42; Key::LEN]);
 let aad = b"file metadata";
-let params = Parameters::from_segment_length(4096)?;
+let params = Parameters::with_segment_length(4096)?;
 
 let input = Cursor::new(b"a potentially large input".as_slice());
 let mut encrypting = EncryptReader::new(
@@ -192,7 +192,7 @@ use fast_floe::{Key, Parameters};
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let key = Key::generate()?;
 let aad = b"example stream";
-let parameters = Parameters::from_segment_length(64 * 1024)?;
+let parameters = Parameters::with_segment_length(64 * 1024)?;
 let segment_size = parameters.plaintext_segment_length();
 let plaintext = vec![b'A'; segment_size * 2 + segment_size / 2];
 let mut input = Cursor::new(&plaintext);
@@ -325,7 +325,7 @@ FLOE accepts any segment length from 64 to 4,294,967,294 (`u32::MAX` - 1)
 bytes, inclusive, including odd lengths and lengths that are not powers of
 two. The constant `Parameters::VALID_SEGMENT_LENGTHS` encodes this range.
 
-Construct `Parameters` with `Parameters::from_segment_length()`, or use one
+Construct `Parameters` with `Parameters::with_segment_length()`, or use one
 of the `Parameters::SEGMENT_*` constants.
 
 Only the encrypted segment length varies; the other FLOE parameters
