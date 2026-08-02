@@ -1,7 +1,7 @@
 //! Bounded-memory `std::io` adapters for FLOE streams.
 //!
 //! [`EncryptReader`]/[`EncryptWriter`] are the recommended encryption adapters.
-//! [`EncryptWriter`] changes [`Write::flush`] in a way that FLOE's framing makes 
+//! [`EncryptWriter`] changes [`Write::flush`] in a way that FLOE's framing makes
 //! unavoidable -- see its documentation.
 //!
 //! [`DecryptReader`] decrypts a stream and, by default,
@@ -591,7 +591,7 @@ impl<R: Read> DecryptReader<R> {
     ///
     /// Use this constructor to enforce a specific segment length: construction
     /// fails before any payload is produced when the authenticated header does
-    /// not match `parameters`. 
+    /// not match `parameters`.
     ///
     /// # Errors
     ///
