@@ -315,11 +315,10 @@ pub struct Decryptor {
 impl Decryptor {
     /// Starts online decryption using the authenticated parameters in `header`.
     ///
-    /// When application policy requires a specific profile, check
-    /// [`Self::parameters`] after construction; the parameter set is
-    /// authenticated before any payload is produced. The whole-message
-    /// [`decrypt_with_parameters`] helper performs that policy check for
-    /// complete slices.
+    /// When application policy requires a specific profile, use
+    /// [`Self::new_with_parameters`], which rejects any other header. The
+    /// whole-message [`decrypt_with_parameters`] helper performs the same
+    /// policy check for complete slices.
     ///
     /// # Errors
     ///
@@ -333,7 +332,18 @@ impl Decryptor {
         })
     }
 
-    pub(crate) fn new_with_parameters(
+    /// Creates a decryptor that requires the header to declare `parameters`.
+    ///
+    /// Use this constructor to enforce a segment length: construction
+    /// fails before any payload is produced when the authenticated header does
+    /// not match `parameters`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHeaderParameters`] when the header declares a
+    /// different parameter set, and other errors when the header is invalid or
+    /// fails authentication.
+    pub fn new_with_parameters(
         key: &Key,
         aad: &[u8],
         parameters: Parameters,

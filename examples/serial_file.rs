@@ -64,15 +64,7 @@ fn decrypt_file(
     parameters: Parameters,
 ) -> AnyResult<()> {
     let input = File::open(input_path)?;
-    let mut reader = DecryptReader::new(input, key, AAD)?;
-
-    if reader.parameters() != parameters {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "parameters read from ciphertext header don't match provided parameters",
-        )
-        .into());
-    }
+    let mut reader = DecryptReader::new_with_parameters(input, key, AAD, parameters)?;
 
     let mut output = create_output(output_path)?;
 

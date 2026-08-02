@@ -1,14 +1,24 @@
 //! Bounded-memory `std::io` adapters for FLOE streams.
 //!
 //! [`EncryptReader`]/[`EncryptWriter`] are the recommended encryption adapters.
-//! [`Write::flush`] semantics that FLOE's framing makes unavoidable — see its
-//! type documentation.
+//! [`EncryptWriter`] changes [`Write::flush`] in a way that FLOE's framing makes 
+//! unavoidable -- see its documentation.
 //!
 //! [`DecryptReader`] decrypts a stream and, by default,
 //! requires the message to occupy the entire underlying stream; use its
 //! `*_frame` finalizers when another frame follows. No push-side decryption
 //! adapter exists because it would reproduce the same partial-segment flush
 //! problem as [`EncryptWriter`] without a pull-side alternative.
+//!
+//! # Error reporting
+//!
+//! Adapter methods report FLOE failures as [`io::Error`] values with the
+//! crate [`Error`] attached as the source: encryption failures use
+//! [`io::ErrorKind::Other`], decryption and authentication failures use
+//! [`io::ErrorKind::InvalidData`], and length violations use
+//! [`io::ErrorKind::InvalidInput`]. Use [`Error::io_source`] to recover the
+//! structured error and distinguish, say, [`Error::AuthenticationFailed`]
+//! from a failure of the wrapped reader or writer.
 
 use std::io::{self, Read, Write};
 
@@ -37,6 +47,13 @@ impl<W> FinishError<W> {
     #[must_use]
     pub const fn error(&self) -> &io::Error {
         &self.error
+    }
+
+    /// Consumes this error, discarding the wrapped I/O object and returning
+    /// the underlying error alone.
+    #[must_use]
+    pub fn into_error(self) -> io::Error {
+        self.error
     }
 
     /// Recovers the wrapped I/O object.
@@ -183,7 +200,10 @@ impl<W: Write> EncryptWriter<W> {
     /// Consumes this writer and extracts the wrapped writer without
     /// completing the FLOE message.
     ///
-    /// The result is likely a truncated, invalid FLOE ciphertext.
+    /// The result is likely a truncated, invalid FLOE ciphertext. Plaintext
+    /// accepted by [`Write::write`] but still buffered (less than a full
+    /// segment) is discarded with this adapter and is not recoverable from
+    /// the returned writer.
     #[must_use]
     pub fn into_inner_unfinished(self) -> W {
         self.inner
@@ -287,7 +307,7 @@ impl<W: Write> Write for EncryptWriter<W> {
         Ok(self.buffer.extend_plaintext(input))
     }
 
-    /// Flushes the wrapped writer, kinda.
+    /// Flushes already-emitted ciphertext to the wrapped writer.
     ///
     /// FLOE cannot emit a partial non-final segment, so buffered plaintext is
     /// **not** written by this method. If you are done encrypting, call
@@ -382,6 +402,12 @@ impl<R: Read> EncryptReader<R> {
 
     /// Extracts the wrapped reader without requiring complete ciphertext
     /// production.
+    ///
+    /// The returned reader's position reflects this adapter's read-ahead, not
+    /// the ciphertext emitted so far: up to one plaintext segment plus a
+    /// one-byte finality lookahead may already have been consumed from the
+    /// source and is discarded with this adapter. If the source must remain
+    /// usable, seek it to a known position afterwards or avoid this method.
     #[must_use]
     pub fn into_inner_unfinished(self) -> R {
         self.inner
@@ -558,8 +584,35 @@ impl<R: Read> DecryptReader<R> {
     pub fn new(mut inner: R, key: &Key, aad: &[u8]) -> io::Result<Self> {
         let header = read_header(&mut inner)?;
         let decryptor = Decryptor::new(key, aad, &header).map_err(decryption_error)?;
+        Ok(Self::from_decryptor(inner, decryptor, header))
+    }
+
+    /// Creates a reader that requires the header to declare `parameters`.
+    ///
+    /// Use this constructor to enforce a specific segment length: construction
+    /// fails before any payload is produced when the authenticated header does
+    /// not match `parameters`. 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the header cannot be read or authenticated, or if
+    /// it declares a parameter set other than `parameters`
+    /// ([`Error::InvalidHeaderParameters`]).
+    pub fn new_with_parameters(
+        mut inner: R,
+        key: &Key,
+        aad: &[u8],
+        parameters: Parameters,
+    ) -> io::Result<Self> {
+        let header = read_header(&mut inner)?;
+        let decryptor = Decryptor::new_with_parameters(key, aad, parameters, &header)
+            .map_err(decryption_error)?;
+        Ok(Self::from_decryptor(inner, decryptor, header))
+    }
+
+    fn from_decryptor(inner: R, decryptor: Decryptor, header: Header) -> Self {
         let parameters = decryptor.parameters();
-        Ok(Self {
+        Self {
             inner,
             decryptor: Some(decryptor),
             header,
@@ -567,7 +620,7 @@ impl<R: Read> DecryptReader<R> {
             plaintext_consumed: 0,
             plaintext_available: 0,
             status: StreamStatus::Open,
-        })
+        }
     }
 
     /// Returns the authenticated header consumed by this reader.
@@ -835,7 +888,6 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
-    use crate::error::crate_error;
     use crate::key::test_key;
     use crate::{decrypt, decrypt_with_parameters, encrypt, random_access};
 
@@ -1340,7 +1392,7 @@ mod tests {
             for error in [stream_error, random_error] {
                 assert_eq!(error.kind(), io::ErrorKind::InvalidData);
                 assert!(matches!(
-                    crate_error(&error),
+                    Error::io_source(&error),
                     Some(Error::InvalidHeaderLength { actual }) if *actual == length
                 ));
             }
@@ -1693,7 +1745,7 @@ mod tests {
         // failure is classified as truncation
         assert_eq!(recovered, plaintext[..capacity]);
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(matches!(crate_error(&error), Some(Error::Truncated)));
+        assert!(matches!(Error::io_source(&error), Some(Error::Truncated)));
 
         // Then later reads report the poisoned stream
         let error = reader.read(&mut chunk).unwrap_err();
@@ -1718,7 +1770,7 @@ mod tests {
         // poisoned
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(matches!(
-            crate_error(&error),
+            Error::io_source(&error),
             Some(Error::InvalidCiphertextLength {
                 actual,
                 required: LengthRequirement::Exactly(required),
@@ -1754,7 +1806,7 @@ mod tests {
             // the reader stays poisoned
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
             assert!(
-                matches!(crate_error(&error), Some(Error::AuthenticationFailed)),
+                matches!(Error::io_source(&error), Some(Error::AuthenticationFailed)),
                 "unexpected error on direct={direct}: {error}"
             );
             assert!(

@@ -1,6 +1,14 @@
 #![forbid(unsafe_code)]
 #![doc = include_str!("../README.md")]
 
+#[cfg(not(any(
+    feature = "rustcrypto",
+    feature = "aws-lc-rs",
+    feature = "boring",
+    feature = "ring"
+)))]
+compile_error!("enable at least one FLOE provider: aws-lc-rs, boring, ring, or rustcrypto");
+
 mod backends;
 mod buffer;
 mod error;
@@ -37,7 +45,9 @@ pub use state::Header;
 /// access is required.
 pub mod low_level {
     pub use crate::buffer::SegmentBuffer;
-    pub use crate::parameters::SEGMENT_PAYLOAD_OFFSET;
+    pub use crate::parameters::{
+        MessageLayout, SEGMENT_PAYLOAD_OFFSET, SegmentKind, SegmentLayout, Segments,
+    };
     pub use crate::state::{
         DecryptionState, EncryptionState, SharedDecryptionContext, SharedEncryptionContext,
         start_decryption, start_decryption_inferred, start_encryption,

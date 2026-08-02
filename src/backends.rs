@@ -1,11 +1,3 @@
-#[cfg(not(any(
-    feature = "rustcrypto",
-    feature = "aws-lc-rs",
-    feature = "boring",
-    feature = "ring"
-)))]
-compile_error!("enable at least one FLOE provider: aws-lc-rs, boring, ring, or rustcrypto");
-
 use crate::provider::ProviderKind;
 use crate::{Provider, Result};
 
@@ -534,6 +526,13 @@ impl AeadKey {
             Self::Ring(key) => key.seal(nonce, aad, in_out, tag),
             #[cfg(feature = "rustcrypto")]
             Self::RustCrypto(key) => key.seal(nonce, aad, in_out, tag),
+            #[cfg(not(any(
+                feature = "aws-lc-rs",
+                feature = "boring",
+                feature = "ring",
+                feature = "rustcrypto"
+            )))]
+            _ => match *self {},
         }
     }
 
@@ -565,6 +564,13 @@ impl AeadKey {
             Self::Ring(key) => key.seal_into(nonce, aad, plaintext, output),
             #[cfg(feature = "rustcrypto")]
             Self::RustCrypto(key) => key.seal_into(nonce, aad, plaintext, output),
+            #[cfg(not(any(
+                feature = "aws-lc-rs",
+                feature = "boring",
+                feature = "ring",
+                feature = "rustcrypto"
+            )))]
+            _ => match *self {},
         }
     }
 
@@ -585,6 +591,13 @@ impl AeadKey {
             Self::Ring(key) => key.open(nonce, aad, ciphertext, tag, output),
             #[cfg(feature = "rustcrypto")]
             Self::RustCrypto(key) => key.open(nonce, aad, ciphertext, tag, output),
+            #[cfg(not(any(
+                feature = "aws-lc-rs",
+                feature = "boring",
+                feature = "ring",
+                feature = "rustcrypto"
+            )))]
+            _ => match *self {},
         }
     }
 
@@ -604,6 +617,13 @@ impl AeadKey {
             Self::Ring(key) => key.open_in_place(nonce, aad, tag, in_out),
             #[cfg(feature = "rustcrypto")]
             Self::RustCrypto(key) => key.open_in_place(nonce, aad, tag, in_out),
+            #[cfg(not(any(
+                feature = "aws-lc-rs",
+                feature = "boring",
+                feature = "ring",
+                feature = "rustcrypto"
+            )))]
+            _ => match *self {},
         }
     }
 }
@@ -753,6 +773,13 @@ impl ProviderRng {
             Self::Ring(rng) => rng.fill(output),
             #[cfg(feature = "rustcrypto")]
             Self::RustCrypto(rng) => rng.fill(output),
+            #[cfg(not(any(
+                feature = "aws-lc-rs",
+                feature = "boring",
+                feature = "ring",
+                feature = "rustcrypto"
+            )))]
+            _ => match *self {},
         }
     }
 
