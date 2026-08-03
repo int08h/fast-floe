@@ -186,10 +186,6 @@ impl SegmentBuffer {
     pub(crate) const fn mark_plaintext(&mut self, length: usize) {
         self.state = BufferState::Plaintext { length };
     }
-
-    pub(crate) const fn mark_empty(&mut self) {
-        self.state = BufferState::Empty;
-    }
 }
 
 impl Drop for SegmentBuffer {

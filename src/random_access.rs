@@ -6,8 +6,11 @@
 //! It also implements [`Read`] and [`Seek`] over the plaintext, so the
 //! decrypted view composes with code that expects an ordinary seekable stream.
 
+use core::mem;
 use core::ops::{Bound, Range, RangeBounds};
 use std::io::{self, Read, Seek, SeekFrom};
+
+use zeroize::Zeroizing;
 
 pub use crate::parameters::{MessageLayout, SegmentLayout, Segments};
 use crate::wire::{
@@ -208,9 +211,10 @@ impl<R: Read + Seek> Reader<R> {
     /// malformed framing, or authentication failure.
     pub fn read_segment(&mut self, position: u64) -> io::Result<Vec<u8>> {
         let segment = self.segment(position)?;
-        let mut plaintext = vec![0; segment.plaintext_length()];
+        let mut plaintext = Zeroizing::new(vec![0; segment.plaintext_length()]);
         self.read_segment_into(position, &mut plaintext)?;
-        Ok(plaintext)
+
+        Ok(mem::take(&mut *plaintext))
     }
 
     /// Authenticates one complete plaintext segment into `output`.
@@ -241,9 +245,10 @@ impl<R: Read + Seek> Reader<R> {
     pub fn read_range(&mut self, range: impl RangeBounds<u64>) -> io::Result<Vec<u8>> {
         let range = resolve_bounds(&range, self.plaintext_length())?;
         let capacity = usize::try_from(range.end - range.start).map_err(|_| length_overflow())?;
-        let mut output = vec![0; capacity];
+        let mut output = Zeroizing::new(vec![0; capacity]);
         self.read_resolved_range_into(range, &mut output)?;
-        Ok(output)
+
+        Ok(mem::take(&mut *output))
     }
 
     /// Authenticates an arbitrary plaintext byte range into `output`.

@@ -39,7 +39,8 @@ impl Key {
     pub fn generate_with_provider(provider: Provider) -> Result<Self> {
         let mut rng = ProviderRng::new(provider);
         let mut key = [0u8; Self::LEN];
-        rng.fill(&mut key)?;
+        rng.generate_key(&mut key)?;
+
         Ok(Self {
             bytes: key,
             provider: Some(provider),

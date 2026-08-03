@@ -14,13 +14,25 @@ exclude = ["kats/"]
 
 [features]
 default = ["aws-lc-rs"]
-rustcrypto = ["dep:aes-gcm", "dep:getrandom", "dep:hmac", "dep:rand_chacha", "dep:sha2"]
+rustcrypto = [
+    "dep:aes",
+    "dep:aes-gcm",
+    "dep:getrandom",
+    "dep:ghash",
+    "dep:hmac",
+    "dep:rand_chacha",
+    "dep:sha2",
+]
 aws-lc-rs = ["dep:aws-lc-rs"]
 boring = ["dep:boring"]
 ring = ["dep:ring"]
 
+# 'aes-gcm' does not forward the 'zeroize' feature to its dep crates 'aes' and 'ghash'
+# so we specify them explicity and let cargo's feature unification forward 'zeroize' to them.
 [dependencies]
+aes = { version = "0.9", optional = true, default-features = false, features = ["zeroize"] }
 aes-gcm = { version = "0.11", optional = true, default-features = false, features = ["aes", "zeroize"] }
+ghash = { version = "0.6", optional = true, default-features = false, features = ["zeroize"] }
 aws-lc-rs = { version = "1.17", optional = true }
 boring = { version = "5.1", optional = true }
 getrandom = { version = "0.4", optional = true }

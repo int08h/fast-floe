@@ -11,6 +11,8 @@
 //! [`SegmentFraming::decode`](crate::SegmentFraming::decode), then pass the
 //! complete segment to [`Decryptor::decrypt_segment`].
 
+use zeroize::Zeroizing;
+
 pub use crate::buffer::SegmentBuffer;
 use crate::wire::split_header;
 use crate::{
@@ -572,7 +574,11 @@ pub fn decrypt_with_parameters(
 
 fn decrypt_body(mut decryptor: Decryptor, mut body: &[u8]) -> Result<Vec<u8>> {
     let parameters = decryptor.parameters();
-    let mut plaintext = Vec::with_capacity(body.len());
+    // The reserved capacity covers every segment, so the vector never
+    // reallocates and the Zeroizing guard wipes all accumulated plaintext if
+    // a later segment is malformed, fails authentication, or is missing.
+    // Success moves the vector out and drops an empty guard.
+    let mut plaintext = Zeroizing::new(Vec::with_capacity(body.len()));
 
     while !body.is_empty() {
         let prefix = segment_prefix(body, parameters)?;
@@ -599,7 +605,7 @@ fn decrypt_body(mut decryptor: Decryptor, mut body: &[u8]) -> Result<Vec<u8>> {
     }
 
     decryptor.finish()?;
-    Ok(plaintext)
+    Ok(core::mem::take(&mut *plaintext))
 }
 
 #[cfg(test)]

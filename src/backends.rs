@@ -783,6 +783,17 @@ impl ProviderRng {
         }
     }
 
+    pub(crate) fn generate_key(&mut self, output: &mut [u8]) -> Result<()> {
+        // `ChaCha12` does not zeroize itself on drop. This is a work-around to
+        // ensure we don't leave rng state that generated a key in memory. All
+        // other providers zeroize themselves and we use them for key generation.
+        #[cfg(feature = "rustcrypto")]
+        if matches!(self, Self::RustCrypto(_)) {
+            return getrandom::fill(output).map_err(|_| crate::Error::RngFailure);
+        }
+        self.fill(output)
+    }
+
     #[cfg(test)]
     pub(crate) const fn name(&self) -> &'static str {
         match self {

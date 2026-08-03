@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use subtle::ConstantTimeEq;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::backends::{AeadKey, ProviderRng};
 use crate::{
@@ -548,7 +548,8 @@ fn open_segment_in_place<'a>(
 }
 
 /// Applies an in-place decryption outcome to the buffer's state machine:
-/// authenticated plaintext on success, an empty buffer on failure.
+/// authenticated plaintext on success, a zeroized empty buffer on failure so
+/// no unauthenticated payload bytes linger in the reusable storage.
 fn finish_in_place_decrypt(buffer: &mut SegmentBuffer, result: Result<usize>) -> Result<&mut [u8]> {
     match result {
         Ok(length) => {
@@ -556,7 +557,7 @@ fn finish_in_place_decrypt(buffer: &mut SegmentBuffer, result: Result<usize>) ->
             buffer.plaintext_mut()
         }
         Err(error) => {
-            buffer.mark_empty();
+            buffer.clear();
             Err(error)
         }
     }
@@ -685,7 +686,9 @@ impl EncryptionState {
                 buffer.ciphertext()
             }
             Err(error) => {
-                buffer.mark_empty();
+                // Zeroize rather than merely discard: the buffer still holds
+                // the plaintext that failed to encrypt.
+                buffer.clear();
                 Err(error)
             }
         }
@@ -900,8 +903,8 @@ impl DecryptionState {
     /// Prepare the ciphertext with [`SegmentBuffer::prepare_ciphertext`]. On
     /// success, this returns the authenticated plaintext within the buffer.
     ///
-    /// Authentication failure may overwrite the ciphertext payload. Callers
-    /// must not use the returned buffer contents unless this method succeeds.
+    /// Failure, including authentication failure, zeroizes the buffer and
+    /// leaves it empty.
     ///
     /// # Errors
     ///
@@ -1008,7 +1011,9 @@ impl DecryptionState {
         kind: SegmentKind,
     ) -> Result<Vec<u8>> {
         let plaintext_length = validate_segment(&self.context, ciphertext_segment, kind)?;
-        let mut output = vec![0u8; plaintext_length];
+        // Zeroizing wipes any partially written plaintext if a later step
+        // fails; success moves the vector out and drops an empty guard.
+        let mut output = Zeroizing::new(vec![0u8; plaintext_length]);
         decrypt_segment_into_inner(
             &self.context,
             &mut self.keys,
@@ -1018,7 +1023,7 @@ impl DecryptionState {
             plaintext_length,
             &mut output,
         )?;
-        Ok(output)
+        Ok(core::mem::take(&mut *output))
     }
 
     /// Allocating decryption for a segment whose framing prefix was already
@@ -1029,9 +1034,9 @@ impl DecryptionState {
         position: u64,
         framing: SegmentFraming,
     ) -> Result<Vec<u8>> {
-        let mut output = vec![0u8; framing.plaintext_length()];
+        let mut output = Zeroizing::new(vec![0u8; framing.plaintext_length()]);
         self.decrypt_segment_into_at_framed(ciphertext_segment, position, framing, &mut output)?;
-        Ok(output)
+        Ok(core::mem::take(&mut *output))
     }
 
     pub(crate) fn decrypt_segment_into_at(
@@ -1467,6 +1472,61 @@ mod tests {
                 .unwrap(),
             full
         );
+    }
+
+    #[test]
+    fn failed_in_place_operations_zeroize_buffer() {
+        // Given a valid single-segment message encrypted through a reusable
+        // buffer
+        let parameters = Parameters::SEGMENT_4_KIB;
+        let (mut encryption, header) =
+            start_encryption(&test_key(), b"buffer wipe", parameters).unwrap();
+        let layout = parameters.plaintext_layout(5).unwrap();
+        let mut buffer = SegmentBuffer::new(parameters);
+        buffer
+            .prepare_plaintext(5)
+            .unwrap()
+            .copy_from_slice(b"hello");
+        let mut segment = encryption
+            .encrypt_segment_in_place(&mut buffer, layout.final_segment())
+            .unwrap()
+            .to_vec();
+
+        // When the segment is tampered with and decryption fails
+        let last = segment.len() - 1;
+        segment[last] ^= 1;
+        let mut decryption =
+            start_decryption(&test_key(), b"buffer wipe", parameters, &header).unwrap();
+        buffer
+            .prepare_ciphertext(segment.len())
+            .unwrap()
+            .copy_from_slice(&segment);
+        assert_eq!(
+            decryption
+                .decrypt_segment_in_place(&mut buffer, layout.final_segment())
+                .unwrap_err(),
+            Error::AuthenticationFailed
+        );
+
+        // Then no payload bytes linger anywhere in the reusable storage
+        assert!(buffer.raw_mut().iter().all(|&byte| byte == 0));
+        assert_eq!(buffer.plaintext(), Err(Error::InvalidBufferState));
+        assert_eq!(buffer.ciphertext(), Err(Error::InvalidBufferState));
+
+        // When encryption fails after plaintext was staged in the buffer
+        buffer
+            .prepare_plaintext(5)
+            .unwrap()
+            .copy_from_slice(b"hello");
+        assert_eq!(
+            encryption
+                .encrypt_segment_in_place_at(&mut buffer, AEAD_MAX_SEGMENTS, SegmentKind::Final)
+                .unwrap_err(),
+            Error::SegmentLimit
+        );
+
+        // Then the staged plaintext is wiped as well
+        assert!(buffer.raw_mut().iter().all(|&byte| byte == 0));
     }
 
     #[test]
