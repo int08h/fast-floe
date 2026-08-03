@@ -425,7 +425,7 @@ within about 5% on 1 MiB segments for `aws-lc-rs`, `ring` and `rustcrypto`
 
 The `std::io` adapters and the random-access reader add overhead to the
 segment operations above. The `Reader` handles whole segments without
-copying; reads smaller than a segment are buffered, at the cost of one copy.
+copying; reads smaller than a segment are buffered, at the cost of one memcpy.
 
 | Provider     | Segments | `EncryptWriter` | `EncryptReader` | `DecryptReader` | Reader (seq) | Reader (range) |
 |--------------|----------|--------------:|--------------:|--------------:|-------------:|---------------:|
