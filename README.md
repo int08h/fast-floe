@@ -1,5 +1,11 @@
 # fast-floe
 
+[![CI](https://github.com/int08h/fast-floe/actions/workflows/ci.yml/badge.svg)](https://github.com/int08h/fast-floe/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/fast-floe.svg)](https://crates.io/crates/fast-floe)
+[![docs.rs](https://docs.rs/fast-floe/badge.svg)](https://docs.rs/fast-floe)
+[![Coverage Status](https://coveralls.io/repos/github/int08h/fast-floe/badge.svg?branch=main)](https://coveralls.io/github/int08h/fast-floe?branch=main)
+[![License](https://img.shields.io/crates/l/fast-floe.svg)](LICENSE)
+
 An optimized, spec-compliant Rust implementation of Fast Lightweight Online
 Encryption (FLOE): authenticated encryption for large files and byte streams,
 with bounded memory, random access and a choice of four cryptography
