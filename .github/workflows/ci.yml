@@ -61,3 +61,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: cargo test --manifest-path tests/fixtures/provider-unification/Cargo.toml
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-tarpaulin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
+      - name: Generate coverage report
+        run: cargo tarpaulin --engine llvm --out Lcov --timeout 300
+      - name: Upload coverage to Coveralls
+        uses: coverallsapp/github-action@v2
+        with:
+          file: lcov.info
+          format: lcov
