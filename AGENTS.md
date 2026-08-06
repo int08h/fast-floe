@@ -26,7 +26,7 @@ Name tests after observable behavior, such as `every_truncation_of_valid_ciphert
 
 ## Commit & Pull Request Guidelines
 
-History favors short, imperative summaries such as `Support additive encryption providers` or `Refresh README`. Keep each commit focused and include tests with behavioral changes. Pull requests should explain the caller-visible effect, identify provider/feature combinations tested, link relevant issues, and include before/after Criterion results for performance-sensitive changes. Never add a "Co-Authored-By" line to commits.
+History favors short, imperative summaries such as `Support additive encryption providers` or `Refresh README`. Keep each commit focused and include tests with behavioral changes. Pull requests should briefly explain the caller-visible effect and include before/after Criterion results for performance-sensitive changes. Never add a "Co-Authored-By" line to commits.
 
 ## Communication
 
