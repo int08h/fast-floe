@@ -14,11 +14,20 @@ enum BufferState {
 /// This type owns the framing offset arithmetic required by FLOE. Callers
 /// prepare either a plaintext payload or an encrypted segment, pass the buffer
 /// to an in-place operation, and then retrieve the authenticated result.
-#[derive(Debug)]
 pub struct SegmentBuffer {
     parameters: Parameters,
     bytes: Vec<u8>,
     state: BufferState,
+}
+
+impl core::fmt::Debug for SegmentBuffer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SegmentBuffer")
+            .field("parameters", &self.parameters)
+            .field("capacity", &self.capacity())
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SegmentBuffer {
@@ -204,6 +213,57 @@ impl Drop for SegmentBuffer {
 mod tests {
     use super::*;
     use crate::SEGMENT_OVERHEAD;
+
+    #[test]
+    fn debug_omits_current_and_stale_payload_bytes() {
+        let mut buffer = SegmentBuffer::new(Parameters::SEGMENT_64_B);
+        for state in ["empty", "plaintext", "ciphertext", "short plaintext"] {
+            buffer.clear();
+            buffer.raw_mut().fill(213);
+            match state {
+                "plaintext" => {
+                    buffer.prepare_plaintext(32).unwrap();
+                }
+                "ciphertext" => {
+                    buffer.prepare_ciphertext(32).unwrap();
+                }
+                "short plaintext" => {
+                    buffer.prepare_plaintext(32).unwrap();
+                    buffer.prepare_plaintext(1).unwrap();
+                }
+                "empty" => {}
+                _ => unreachable!(),
+            }
+            for debug in [format!("{buffer:?}"), format!("{buffer:#?}")] {
+                assert!(debug.contains("SegmentBuffer"));
+                assert!(debug.contains("parameters"));
+                assert!(debug.contains("capacity"));
+                assert!(debug.contains("state"));
+                assert!(!debug.contains("213"), "{state}: {debug}");
+                assert!(!debug.contains("bytes"), "{state}: {debug}");
+            }
+        }
+    }
+
+    #[test]
+    fn debug_omits_authenticated_plaintext() {
+        let parameters = Parameters::SEGMENT_64_B;
+        let key = crate::key::test_key();
+        let encryptor = crate::online::Encryptor::new(&key, b"debug", parameters).unwrap();
+        let header = *encryptor.header();
+        let ciphertext = encryptor.encrypt_final_segment(&[213; 4]).unwrap();
+        let mut buffer = SegmentBuffer::new(parameters);
+        buffer
+            .prepare_ciphertext(ciphertext.len())
+            .unwrap()
+            .copy_from_slice(&ciphertext);
+        let mut decryptor = crate::online::Decryptor::new(&key, b"debug", &header).unwrap();
+        decryptor.decrypt_segment_in_place(&mut buffer).unwrap();
+        for debug in [format!("{buffer:?}"), format!("{buffer:#?}")] {
+            assert!(debug.contains("Plaintext"));
+            assert!(!debug.contains("213"));
+        }
+    }
 
     #[test]
     fn extend_plaintext_appends_and_saturates_at_capacity() {

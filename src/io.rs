@@ -332,7 +332,6 @@ impl<W: Write> Write for EncryptWriter<W> {
 ///
 /// Dropping the adapter or calling [`Self::into_inner_unfinished`] before
 /// [`Self::is_finished`] is true abandons the incomplete ciphertext stream.
-#[derive(Debug)]
 pub struct EncryptReader<R> {
     inner: R,
     encryptor: Option<Encryptor>,
@@ -343,6 +342,22 @@ pub struct EncryptReader<R> {
     ciphertext_length: usize,
     lookahead: Option<u8>,
     status: StreamStatus,
+}
+
+impl<R: core::fmt::Debug> core::fmt::Debug for EncryptReader<R> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("EncryptReader")
+            .field("inner", &self.inner)
+            .field("encryptor", &self.encryptor)
+            .field("header", &self.header)
+            .field("header_position", &self.header_position)
+            .field("buffer", &self.buffer)
+            .field("ciphertext_position", &self.ciphertext_position)
+            .field("ciphertext_length", &self.ciphertext_length)
+            .field("has_lookahead", &self.lookahead.is_some())
+            .field("status", &self.status)
+            .finish()
+    }
 }
 
 impl<R: Read> EncryptReader<R> {
@@ -890,6 +905,69 @@ mod tests {
     use super::*;
     use crate::key::test_key;
     use crate::{decrypt, decrypt_with_parameters, encrypt, random_access};
+
+    struct RedactedIo(Cursor<Vec<u8>>);
+
+    impl core::fmt::Debug for RedactedIo {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("RedactedIo")
+        }
+    }
+
+    impl Read for RedactedIo {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            self.0.read(output)
+        }
+    }
+
+    impl std::io::Seek for RedactedIo {
+        fn seek(&mut self, position: std::io::SeekFrom) -> io::Result<u64> {
+            std::io::Seek::seek(&mut self.0, position)
+        }
+    }
+
+    #[test]
+    fn adapter_debug_omits_internal_plaintext_and_lookahead() {
+        let parameters = Parameters::SEGMENT_64_B;
+        let key = test_key();
+        let plaintext = vec![213; parameters.plaintext_segment_length() + 1];
+        let mut writer = EncryptWriter::new(io::sink(), &key, b"debug", parameters).unwrap();
+        writer.write_all(&plaintext[..4]).unwrap();
+
+        let mut encrypting = EncryptReader::new(
+            RedactedIo(Cursor::new(plaintext.clone())),
+            &key,
+            b"debug",
+            parameters,
+        )
+        .unwrap();
+        encrypting.read_exact(&mut [0; Header::LEN]).unwrap();
+        encrypting.read_exact(&mut [0; 64]).unwrap();
+        assert_eq!(encrypting.lookahead, Some(213));
+
+        let ciphertext = encrypt(&key, b"debug", parameters, &plaintext).unwrap();
+        let mut decrypting =
+            DecryptReader::new(RedactedIo(Cursor::new(ciphertext.clone())), &key, b"debug")
+                .unwrap();
+        decrypting.read_exact(&mut [0; 1]).unwrap();
+        let mut random =
+            random_access::Reader::new(RedactedIo(Cursor::new(ciphertext)), &key, b"debug")
+                .unwrap();
+        random.read_exact(&mut [0; 1]).unwrap();
+
+        for adapter in [
+            &writer as &dyn core::fmt::Debug,
+            &encrypting,
+            &decrypting,
+            &random,
+        ] {
+            for debug in [format!("{adapter:?}"), format!("{adapter:#?}")] {
+                let compact: String = debug.split_whitespace().collect();
+                assert!(!compact.contains("213,213,213,213"), "{debug}");
+                assert!(!compact.contains("lookahead:Some(213)"), "{debug}");
+            }
+        }
+    }
 
     #[derive(Debug, Default)]
     struct FlushFails(Vec<u8>);
