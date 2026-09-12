@@ -467,6 +467,18 @@ fn validate_segment(
 }
 
 #[inline]
+fn validate_framed_length(actual: usize, framing: SegmentFraming) -> Result<usize> {
+    let expected = framing.ciphertext_length();
+    if actual != expected {
+        return Err(Error::InvalidCiphertextLength {
+            actual,
+            required: LengthRequirement::Exactly(expected),
+        });
+    }
+    Ok(framing.plaintext_length())
+}
+
+#[inline]
 fn decrypt_segment_into_inner(
     context: &MessageContext,
     keys: &mut KeyCache,
@@ -952,20 +964,14 @@ impl DecryptionState {
             return Err(Error::InvalidParameters);
         }
         let ciphertext_length = buffer.ciphertext_length()?;
-        let expected = framing.ciphertext_length();
-        if ciphertext_length != expected {
-            return Err(Error::InvalidCiphertextLength {
-                actual: ciphertext_length,
-                required: LengthRequirement::Exactly(expected),
-            });
-        }
+        let plaintext_length = validate_framed_length(ciphertext_length, framing)?;
         let result = open_segment_in_place(
             &self.context,
             &mut self.keys,
             &mut buffer.raw_mut()[..ciphertext_length],
             position,
             framing.kind(),
-            framing.plaintext_length(),
+            plaintext_length,
         )
         .map(|plaintext| plaintext.len());
         finish_in_place_decrypt(buffer, result)
@@ -1034,8 +1040,17 @@ impl DecryptionState {
         position: u64,
         framing: SegmentFraming,
     ) -> Result<Vec<u8>> {
-        let mut output = Zeroizing::new(vec![0u8; framing.plaintext_length()]);
-        self.decrypt_segment_into_at_framed(ciphertext_segment, position, framing, &mut output)?;
+        let plaintext_length = validate_framed_length(ciphertext_segment.len(), framing)?;
+        let mut output = Zeroizing::new(vec![0u8; plaintext_length]);
+        decrypt_segment_into_inner(
+            &self.context,
+            &mut self.keys,
+            ciphertext_segment,
+            position,
+            framing.kind(),
+            plaintext_length,
+            &mut output,
+        )?;
         Ok(core::mem::take(&mut *output))
     }
 
@@ -1065,20 +1080,14 @@ impl DecryptionState {
         framing: SegmentFraming,
         output: &mut [u8],
     ) -> Result<usize> {
-        let expected = framing.ciphertext_length();
-        if ciphertext_segment.len() != expected {
-            return Err(Error::InvalidCiphertextLength {
-                actual: ciphertext_segment.len(),
-                required: LengthRequirement::Exactly(expected),
-            });
-        }
+        let plaintext_length = validate_framed_length(ciphertext_segment.len(), framing)?;
         decrypt_segment_into_inner(
             &self.context,
             &mut self.keys,
             ciphertext_segment,
             position,
             framing.kind(),
-            framing.plaintext_length(),
+            plaintext_length,
             output,
         )
     }

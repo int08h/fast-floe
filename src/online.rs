@@ -838,6 +838,77 @@ mod tests {
     }
 
     #[test]
+    fn malformed_segment_lengths_preserve_position_and_allow_retry() {
+        for &provider in crate::Provider::COMPILED {
+            let key = Key::from_bytes_with_provider([0x43; Key::LEN], provider);
+            let parameters = Parameters::SEGMENT_64_B;
+            let encryption = Encryptor::new(&key, b"length retry", parameters).unwrap();
+            let header = *encryption.header();
+            let valid = encryption.encrypt_final_segment(b"done").unwrap();
+            let mut too_long = valid.clone();
+            too_long.push(0);
+            let cases = [
+                (valid[..4].to_vec(), valid.len()),
+                (
+                    u32::MAX.to_be_bytes().to_vec(),
+                    parameters.ciphertext_segment_length(),
+                ),
+                (valid[..valid.len() - 1].to_vec(), valid.len()),
+                (too_long, valid.len()),
+            ];
+            for (invalid, expected_length) in cases {
+                for mode in 0..3 {
+                    let mut decryptor = Decryptor::new(&key, b"length retry", &header).unwrap();
+                    let error = match mode {
+                        0 => decryptor.decrypt_segment(&invalid).unwrap_err(),
+                        1 => decryptor
+                            .decrypt_segment_into(&invalid, &mut [0; 32])
+                            .unwrap_err(),
+                        _ if invalid.len() >= SEGMENT_OVERHEAD => {
+                            let mut buffer = SegmentBuffer::new(parameters);
+                            buffer
+                                .prepare_ciphertext(invalid.len())
+                                .unwrap()
+                                .copy_from_slice(&invalid);
+                            decryptor.decrypt_segment_in_place(&mut buffer).unwrap_err()
+                        }
+                        _ => continue, // SegmentBuffer rejects sub-overhead preparation itself.
+                    };
+                    assert_eq!(
+                        error,
+                        Error::InvalidCiphertextLength {
+                            actual: invalid.len(),
+                            required: LengthRequirement::Exactly(expected_length),
+                        }
+                    );
+                    assert_eq!(decryptor.next_position(), 0);
+                    assert!(!decryptor.is_finished());
+                    assert_eq!(decryptor.decrypt_segment(&valid).unwrap(), b"done");
+                    decryptor.finish().unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn short_segment_with_large_declared_length_is_rejected() {
+        let parameters = Parameters::SEGMENT_1_MIB;
+        let encryption = Encryptor::new(&test_key(), b"large prefix", parameters).unwrap();
+        let mut decryptor =
+            Decryptor::new(&test_key(), b"large prefix", encryption.header()).unwrap();
+        for prefix in [1_048_576_u32, u32::MAX] {
+            assert_eq!(
+                decryptor.decrypt_segment(&prefix.to_be_bytes()),
+                Err(Error::InvalidCiphertextLength {
+                    actual: SEGMENT_PREFIX_LENGTH,
+                    required: LengthRequirement::Exactly(parameters.ciphertext_segment_length()),
+                })
+            );
+            assert_eq!(decryptor.next_position(), 0);
+        }
+    }
+
+    #[test]
     fn final_segment_round_trips_in_place() {
         // Given a final payload prepared in a reusable segment buffer
         let parameters = Parameters::SEGMENT_4_KIB;
