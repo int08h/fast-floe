@@ -2,9 +2,9 @@
 //! returned by `MessageLayout::segments`.
 //!
 //! ```text
-//! cargo run --example manual_file --features ring -- \
+//! cargo run --example manual_file --no-default-features --features ring -- \
 //!     encrypt INPUT OUTPUT 64_HEX_KEY [4k|1m]
-//! cargo run --example manual_file --features ring -- \
+//! cargo run --example manual_file --no-default-features --features ring -- \
 //!     decrypt INPUT OUTPUT 64_HEX_KEY [4k|1m]
 //! ```
 

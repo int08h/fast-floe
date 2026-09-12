@@ -1,9 +1,9 @@
 //! Demonstrates file encryption and decryption using the `std::io` adapters.
 //!
 //! ```text
-//! cargo run --example serial_file --features ring -- \
+//! cargo run --example serial_file --no-default-features --features ring -- \
 //!     encrypt INPUT OUTPUT 64_HEX_KEY [4k|1m]
-//! cargo run --example serial_file --features ring -- \
+//! cargo run --example serial_file --no-default-features --features ring -- \
 //!     decrypt INPUT OUTPUT 64_HEX_KEY [4k|1m]
 //! ```
 
