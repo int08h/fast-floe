@@ -559,22 +559,6 @@ fn open_segment_in_place<'a>(
     Ok(ciphertext)
 }
 
-/// Applies an in-place decryption outcome to the buffer's state machine:
-/// authenticated plaintext on success, a zeroized empty buffer on failure so
-/// no unauthenticated payload bytes linger in the reusable storage.
-fn finish_in_place_decrypt(buffer: &mut SegmentBuffer, result: Result<usize>) -> Result<&mut [u8]> {
-    match result {
-        Ok(length) => {
-            buffer.mark_plaintext(length);
-            buffer.plaintext_mut()
-        }
-        Err(error) => {
-            buffer.clear();
-            Err(error)
-        }
-    }
-}
-
 #[inline]
 fn validate_layout(context: &MessageContext, segment: SegmentLayout) -> Result<()> {
     if segment.parameters() == context.parameters {
@@ -928,44 +912,36 @@ impl DecryptionState {
         buffer: &'a mut SegmentBuffer,
         segment: SegmentLayout,
     ) -> Result<&'a mut [u8]> {
-        self.validate_ciphertext_layout(buffer.ciphertext_length()?, segment)?;
-        self.decrypt_segment_in_place_at(buffer, segment.position(), segment.kind())
-    }
-
-    pub(crate) fn decrypt_segment_in_place_at<'a>(
-        &mut self,
-        buffer: &'a mut SegmentBuffer,
-        position: u64,
-        kind: SegmentKind,
-    ) -> Result<&'a mut [u8]> {
-        if !buffer.matches(self.parameters()) {
-            return Err(Error::InvalidParameters);
-        }
-        let ciphertext_length = buffer.ciphertext_length()?;
-        let result = self
-            .decrypt_segment_in_place_raw_at(
+        buffer.decrypt_with(|buffer| {
+            let ciphertext_length = buffer.ciphertext_length()?;
+            self.validate_ciphertext_layout(ciphertext_length, segment)?;
+            if !buffer.matches(self.parameters()) {
+                return Err(Error::InvalidParameters);
+            }
+            self.decrypt_segment_in_place_raw_at(
                 &mut buffer.raw_mut()[..ciphertext_length],
-                position,
-                kind,
+                segment.position(),
+                segment.kind(),
             )
-            .map(|plaintext| plaintext.len());
-        finish_in_place_decrypt(buffer, result)
+            .map(|plaintext| plaintext.len())
+        })
     }
 
     /// In-place decryption for a segment whose framing prefix was already
     /// decoded, so the prefix is not parsed and validated a second time.
-    pub(crate) fn decrypt_segment_in_place_at_framed<'a>(
+    /// The caller owns the buffer cleanup boundary and state transition.
+    pub(crate) fn decrypt_segment_in_place_at_framed(
         &mut self,
-        buffer: &'a mut SegmentBuffer,
+        buffer: &mut SegmentBuffer,
         position: u64,
         framing: SegmentFraming,
-    ) -> Result<&'a mut [u8]> {
+    ) -> Result<usize> {
         if !buffer.matches(self.parameters()) {
             return Err(Error::InvalidParameters);
         }
         let ciphertext_length = buffer.ciphertext_length()?;
         let plaintext_length = validate_framed_length(ciphertext_length, framing)?;
-        let result = open_segment_in_place(
+        open_segment_in_place(
             &self.context,
             &mut self.keys,
             &mut buffer.raw_mut()[..ciphertext_length],
@@ -973,8 +949,7 @@ impl DecryptionState {
             framing.kind(),
             plaintext_length,
         )
-        .map(|plaintext| plaintext.len());
-        finish_in_place_decrypt(buffer, result)
+        .map(|plaintext| plaintext.len())
     }
 
     /// Authenticates and decrypts a segment in caller-managed storage.
@@ -1536,6 +1511,94 @@ mod tests {
 
         // Then the staged plaintext is wiped as well
         assert!(buffer.raw_mut().iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn every_buffered_decryption_error_clears_storage() {
+        for &provider in Provider::COMPILED {
+            let key = Key::from_bytes_with_provider([0x43; Key::LEN], provider);
+            let parameters = Parameters::SEGMENT_4_KIB;
+            let segment = parameters.plaintext_layout(3).unwrap().final_segment();
+            let (mut encryption, header) = start_encryption(&key, b"cleanup", parameters).unwrap();
+            let ciphertext = encryption.encrypt_segment(b"abc", segment).unwrap();
+
+            for failure in [
+                "plaintext",
+                "empty",
+                "buffer parameters",
+                "layout parameters",
+                "short",
+                "long",
+                "prefix",
+                "tag",
+            ] {
+                let buffer_parameters = if failure == "buffer parameters" {
+                    Parameters::SEGMENT_64_B
+                } else {
+                    parameters
+                };
+                let mut buffer = SegmentBuffer::new(buffer_parameters);
+                buffer.raw_mut().fill(0xa5); // Include stale bytes beyond the prepared segment.
+                buffer
+                    .prepare_ciphertext(ciphertext.len())
+                    .unwrap()
+                    .copy_from_slice(&ciphertext);
+                let mut layout = segment;
+                match failure {
+                    "plaintext" => {
+                        buffer.prepare_plaintext(3).unwrap();
+                    }
+                    "empty" => {
+                        buffer.clear();
+                        buffer.raw_mut().fill(0xa5);
+                    }
+                    "layout parameters" => {
+                        layout = Parameters::SEGMENT_64_B
+                            .plaintext_layout(3)
+                            .unwrap()
+                            .final_segment();
+                    }
+                    "short" => {
+                        buffer.prepare_ciphertext(ciphertext.len() - 1).unwrap();
+                    }
+                    "long" => {
+                        buffer.prepare_ciphertext(ciphertext.len() + 1).unwrap();
+                    }
+                    "prefix" => {
+                        buffer.raw_mut()[0] ^= 1;
+                    }
+                    "tag" => {
+                        buffer.raw_mut()[ciphertext.len() - 1] ^= 1;
+                    }
+                    "buffer parameters" => {}
+                    _ => unreachable!(),
+                }
+                let mut decryption =
+                    start_decryption(&key, b"cleanup", parameters, &header).unwrap();
+                assert!(
+                    decryption
+                        .decrypt_segment_in_place(&mut buffer, layout)
+                        .is_err(),
+                    "{failure}"
+                );
+                assert!(buffer.raw_mut().iter().all(|&byte| byte == 0), "{failure}");
+                assert_eq!(buffer.plaintext(), Err(Error::InvalidBufferState));
+                assert_eq!(buffer.ciphertext(), Err(Error::InvalidBufferState));
+
+                if buffer_parameters == parameters {
+                    buffer
+                        .prepare_ciphertext(ciphertext.len())
+                        .unwrap()
+                        .copy_from_slice(&ciphertext);
+                    assert_eq!(
+                        decryption
+                            .decrypt_segment_in_place(&mut buffer, segment)
+                            .unwrap(),
+                        b"abc"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

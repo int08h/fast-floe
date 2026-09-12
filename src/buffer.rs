@@ -96,15 +96,6 @@ impl SegmentBuffer {
         }
     }
 
-    pub(crate) fn plaintext_mut(&mut self) -> Result<&mut [u8]> {
-        match self.state {
-            BufferState::Plaintext { length } => {
-                Ok(&mut self.bytes[SEGMENT_PAYLOAD_OFFSET..SEGMENT_PAYLOAD_OFFSET + length])
-            }
-            BufferState::Empty | BufferState::Ciphertext { .. } => Err(Error::InvalidBufferState),
-        }
-    }
-
     /// Returns a slice positioned at the prepared or generated ciphertext.
     ///
     /// # Errors
@@ -183,8 +174,23 @@ impl SegmentBuffer {
         self.state = BufferState::Ciphertext { length };
     }
 
-    pub(crate) const fn mark_plaintext(&mut self, length: usize) {
-        self.state = BufferState::Plaintext { length };
+    /// Runs validation and decryption inside one cleanup boundary. The
+    /// operation returns an authenticated payload length without changing
+    /// the logical buffer state. Every error wipes the entire allocation.
+    pub(crate) fn decrypt_with(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> Result<usize>,
+    ) -> Result<&mut [u8]> {
+        match operation(self) {
+            Ok(length) => {
+                self.state = BufferState::Plaintext { length };
+                Ok(&mut self.bytes[SEGMENT_PAYLOAD_OFFSET..SEGMENT_PAYLOAD_OFFSET + length])
+            }
+            Err(error) => {
+                self.clear();
+                Err(error)
+            }
+        }
     }
 }
 

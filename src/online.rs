@@ -440,6 +440,9 @@ impl Decryptor {
 
     /// Authenticates and decrypts the encrypted segment prepared in `buffer`.
     ///
+    /// Every failure zeroizes the complete buffer and leaves it empty. The
+    /// segment position is unchanged; prepare and refill the buffer to retry.
+    ///
     /// # Errors
     ///
     /// Returns an error for invalid buffer state or parameters, malformed
@@ -448,9 +451,11 @@ impl Decryptor {
         &mut self,
         buffer: &'a mut SegmentBuffer,
     ) -> Result<&'a mut [u8]> {
-        let framing = self.framing(buffer.ciphertext()?)?;
-        self.advance(framing.kind(), |state, position| {
-            state.decrypt_segment_in_place_at_framed(buffer, position, framing)
+        buffer.decrypt_with(|buffer| {
+            let framing = self.framing(buffer.ciphertext()?)?;
+            self.advance(framing.kind(), |state, position| {
+                state.decrypt_segment_in_place_at_framed(buffer, position, framing)
+            })
         })
     }
 
@@ -906,6 +911,105 @@ mod tests {
             );
             assert_eq!(decryptor.next_position(), 0);
         }
+    }
+
+    #[test]
+    fn online_in_place_errors_clear_storage_without_advancing() {
+        for &provider in crate::Provider::COMPILED {
+            let key = Key::from_bytes_with_provider([0x43; Key::LEN], provider);
+            let parameters = Parameters::SEGMENT_64_B;
+            let encryption = Encryptor::new(&key, b"online cleanup", parameters).unwrap();
+            let header = *encryption.header();
+            let valid = encryption.encrypt_final_segment(b"abc").unwrap();
+            for failure in [
+                "plaintext",
+                "parameters",
+                "prefix",
+                "short",
+                "tag",
+                "closed",
+                "limit",
+            ] {
+                let buffer_parameters = if failure == "parameters" {
+                    Parameters::SEGMENT_4_KIB
+                } else {
+                    parameters
+                };
+                let mut buffer = SegmentBuffer::new(buffer_parameters);
+                buffer.raw_mut().fill(0xa5);
+                buffer
+                    .prepare_ciphertext(valid.len())
+                    .unwrap()
+                    .copy_from_slice(&valid);
+                let mut decryptor = Decryptor::new(&key, b"online cleanup", &header).unwrap();
+                match failure {
+                    "plaintext" => {
+                        buffer.prepare_plaintext(3).unwrap();
+                    }
+                    "prefix" => {
+                        buffer.raw_mut()[..SEGMENT_PREFIX_LENGTH].fill(0);
+                    }
+                    "short" => {
+                        buffer.prepare_ciphertext(valid.len() - 1).unwrap();
+                    }
+                    "tag" => {
+                        buffer.raw_mut()[valid.len() - 1] ^= 1;
+                    }
+                    "closed" => {
+                        decryptor.decrypt_segment(&valid).unwrap();
+                    }
+                    "limit" => {
+                        decryptor.counter.next = AEAD_MAX_SEGMENTS;
+                    }
+                    "parameters" => {}
+                    _ => unreachable!(),
+                }
+                let counter = decryptor.counter;
+                assert!(
+                    decryptor.decrypt_segment_in_place(&mut buffer).is_err(),
+                    "{failure}"
+                );
+                assert_eq!(decryptor.counter, counter, "{failure}");
+                assert!(buffer.raw_mut().iter().all(|&byte| byte == 0), "{failure}");
+                assert_eq!(buffer.plaintext(), Err(Error::InvalidBufferState));
+                assert_eq!(buffer.ciphertext(), Err(Error::InvalidBufferState));
+
+                if !matches!(failure, "parameters" | "closed" | "limit") {
+                    buffer
+                        .prepare_ciphertext(valid.len())
+                        .unwrap()
+                        .copy_from_slice(&valid);
+                    assert_eq!(
+                        decryptor.decrypt_segment_in_place(&mut buffer).unwrap(),
+                        b"abc"
+                    );
+                    decryptor.finish().unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_final_segment_leaves_authenticated_empty_plaintext() {
+        let parameters = Parameters::SEGMENT_64_B;
+        let encryption = Encryptor::new(&test_key(), b"empty final", parameters).unwrap();
+        let header = *encryption.header();
+        let valid = encryption.encrypt_final_segment(&[]).unwrap();
+        let mut buffer = SegmentBuffer::new(parameters);
+        buffer
+            .prepare_ciphertext(valid.len())
+            .unwrap()
+            .copy_from_slice(&valid);
+        let mut decryptor = Decryptor::new(&test_key(), b"empty final", &header).unwrap();
+        assert!(
+            decryptor
+                .decrypt_segment_in_place(&mut buffer)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(buffer.plaintext(), Ok([].as_slice()));
+        assert_eq!(buffer.ciphertext(), Err(Error::InvalidBufferState));
+        decryptor.finish().unwrap();
     }
 
     #[test]
