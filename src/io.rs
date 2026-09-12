@@ -33,6 +33,14 @@ enum StreamStatus {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DecryptStatus {
+    Open,
+    FrameComplete,
+    StreamComplete,
+    Failed,
+}
+
 /// Error returned when consuming I/O-adapter finalization cannot complete.
 ///
 /// The wrapped I/O object remains recoverable with [`Self::into_inner`],
@@ -586,7 +594,7 @@ pub struct DecryptReader<R> {
     buffer: SegmentBuffer,
     plaintext_consumed: usize,
     plaintext_available: usize,
-    status: StreamStatus,
+    status: DecryptStatus,
 }
 
 impl<R: Read> DecryptReader<R> {
@@ -634,7 +642,7 @@ impl<R: Read> DecryptReader<R> {
             buffer: SegmentBuffer::new(parameters),
             plaintext_consumed: 0,
             plaintext_available: 0,
-            status: StreamStatus::Open,
+            status: DecryptStatus::Open,
         }
     }
 
@@ -659,22 +667,32 @@ impl<R: Read> DecryptReader<R> {
     /// Returns a mutable reference to the wrapped reader.
     ///
     /// Reading ciphertext directly can corrupt the FLOE message boundary.
+    /// Mutable access invalidates any previous EOF verification, so the next
+    /// whole-stream finalization checks the underlying reader again.
     pub const fn get_mut(&mut self) -> &mut R {
+        if matches!(self.status, DecryptStatus::StreamComplete) {
+            self.status = DecryptStatus::FrameComplete;
+        }
         &mut self.inner
     }
 
     /// Returns whether the final segment was authenticated and all its
     /// plaintext was consumed.
+    /// This does not imply that underlying EOF was verified; use
+    /// [`Self::try_finish`] or [`Self::finish`] to check for trailing data.
     #[must_use]
     pub const fn is_finished(&self) -> bool {
-        matches!(self.status, StreamStatus::Finished)
-            && self.plaintext_consumed == self.plaintext_available
+        matches!(
+            self.status,
+            DecryptStatus::FrameComplete | DecryptStatus::StreamComplete
+        ) && self.plaintext_consumed == self.plaintext_available
     }
 
     /// Authenticates any unread remainder of the message and requires
     /// underlying EOF, without consuming this adapter.
     ///
-    /// This is idempotent after success. After an error, the reader is
+    /// This performs no further I/O after success unless [`Self::get_mut`]
+    /// invalidates EOF verification. After an error, the reader is
     /// poisoned because invalid input may have been partially consumed.
     /// Detecting trailing data consumes one byte from the wrapped reader.
     ///
@@ -683,19 +701,25 @@ impl<R: Read> DecryptReader<R> {
     /// Returns an error for truncated, malformed, or unauthenticated unread
     /// ciphertext, or for any byte after the authenticated final segment.
     pub fn try_finish(&mut self) -> io::Result<()> {
+        if self.status == DecryptStatus::StreamComplete {
+            return Ok(());
+        }
         self.drain_message()?;
         let mut trailing = [0; 1];
         match read_fully(&mut self.inner, &mut trailing) {
-            Ok(0) => Ok(()),
+            Ok(0) => {
+                self.status = DecryptStatus::StreamComplete;
+                Ok(())
+            }
             Ok(_) => {
-                self.status = StreamStatus::Failed;
+                self.status = DecryptStatus::Failed;
                 Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "FLOE ciphertext has data after its final segment",
                 ))
             }
             Err(error) => {
-                self.status = StreamStatus::Failed;
+                self.status = DecryptStatus::Failed;
                 Err(error)
             }
         }
@@ -751,12 +775,12 @@ impl<R: Read> DecryptReader<R> {
     fn drain_message(&mut self) -> io::Result<()> {
         self.plaintext_consumed = self.plaintext_available;
 
-        while self.status == StreamStatus::Open {
+        while self.status == DecryptStatus::Open {
             self.load_segment()?;
             self.plaintext_consumed = self.plaintext_available;
         }
 
-        if self.status == StreamStatus::Failed {
+        if self.status == DecryptStatus::Failed {
             Err(poisoned_error())
         } else {
             Ok(())
@@ -766,7 +790,7 @@ impl<R: Read> DecryptReader<R> {
     fn load_segment(&mut self) -> io::Result<()> {
         let result = self.try_load_segment();
         if result.is_err() {
-            self.status = StreamStatus::Failed;
+            self.status = DecryptStatus::Failed;
         }
         result
     }
@@ -824,7 +848,7 @@ impl<R: Read> DecryptReader<R> {
                 .ok_or_else(poisoned_error)?
                 .finish()
                 .map_err(decryption_error)?;
-            self.status = StreamStatus::Finished;
+            self.status = DecryptStatus::FrameComplete;
         }
         Ok(())
     }
@@ -832,7 +856,7 @@ impl<R: Read> DecryptReader<R> {
     fn read_segment_direct(&mut self, output: &mut [u8]) -> io::Result<usize> {
         let result = self.try_read_segment_direct(output);
         if result.is_err() {
-            self.status = StreamStatus::Failed;
+            self.status = DecryptStatus::Failed;
         }
         result
     }
@@ -864,12 +888,15 @@ impl<R: Read> Read for DecryptReader<R> {
             return Ok(0);
         }
 
-        if self.status == StreamStatus::Failed {
+        if self.status == DecryptStatus::Failed {
             return Err(poisoned_error());
         }
 
         if self.plaintext_consumed == self.plaintext_available {
-            if self.status == StreamStatus::Finished {
+            if matches!(
+                self.status,
+                DecryptStatus::FrameComplete | DecryptStatus::StreamComplete
+            ) {
                 return Ok(0);
             }
             if output.len() >= self.parameters().plaintext_segment_length() {
@@ -877,7 +904,10 @@ impl<R: Read> Read for DecryptReader<R> {
             }
             self.load_segment()?;
             if self.plaintext_consumed == self.plaintext_available {
-                debug_assert_eq!(self.status, StreamStatus::Finished);
+                debug_assert!(matches!(
+                    self.status,
+                    DecryptStatus::FrameComplete | DecryptStatus::StreamComplete
+                ));
                 return Ok(0);
             }
         }
@@ -1933,15 +1963,104 @@ mod tests {
 
     #[test]
     fn decrypt_reader_try_finish_is_idempotent_after_success() {
-        // Given a reader finished successfully in place
-        let parameters = Parameters::SEGMENT_4_KIB;
-        let ciphertext = encrypt(&test_key(), b"io", parameters, b"message").unwrap();
+        struct EofOnceReader {
+            data: Cursor<Vec<u8>>,
+            read_calls: usize,
+            eof_seen: bool,
+        }
+        impl Read for EofOnceReader {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                self.read_calls += 1;
+                if self.eof_seen {
+                    return Err(io::Error::other("read after verified EOF"));
+                }
+                let read = self.data.read(output)?;
+                self.eof_seen = read == 0 && !output.is_empty();
+                Ok(read)
+            }
+        }
+
+        let parameters = Parameters::SEGMENT_64_B;
+        let plaintext = vec![0x42; 65];
+        let ciphertext = encrypt(&test_key(), b"io", parameters, &plaintext).unwrap();
+        // Cover draining unread ciphertext, buffered reads, and direct reads.
+        for chunk_length in [0, 1, 64] {
+            let source = EofOnceReader {
+                data: Cursor::new(ciphertext.clone()),
+                read_calls: 0,
+                eof_seen: false,
+            };
+            let mut reader = DecryptReader::new(source, &test_key(), b"io").unwrap();
+            if chunk_length > 0 {
+                let mut recovered = Vec::new();
+                let mut output = vec![0; chunk_length];
+                loop {
+                    let read = reader.read(&mut output).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    recovered.extend_from_slice(&output[..read]);
+                }
+                assert_eq!(recovered, plaintext);
+                assert!(reader.is_finished());
+                assert!(!reader.get_ref().eof_seen);
+            }
+            reader.try_finish().unwrap();
+            let calls = reader.get_ref().read_calls;
+            assert!(reader.get_ref().eof_seen);
+            reader.try_finish().unwrap();
+            reader.try_finish_frame().unwrap();
+            reader.try_finish().unwrap();
+            assert_eq!(reader.read(&mut [0; 1]).unwrap(), 0);
+            assert!(reader.is_finished());
+            assert_eq!(reader.get_ref().read_calls, calls);
+            let inner = reader.finish().unwrap();
+            assert_eq!(inner.read_calls, calls);
+        }
+    }
+
+    #[test]
+    fn frame_finish_still_requires_a_whole_stream_eof_check() {
+        let ciphertext = encrypt(&test_key(), b"io", Parameters::SEGMENT_64_B, b"message").unwrap();
+        for trailing in [false, true] {
+            let mut input = ciphertext.clone();
+            if trailing {
+                input.extend_from_slice(b"next frame");
+            }
+            let mut reader = DecryptReader::new(Cursor::new(input), &test_key(), b"io").unwrap();
+            reader.try_finish_frame().unwrap();
+            reader.try_finish_frame().unwrap();
+            assert_eq!(reader.get_ref().position(), ciphertext.len() as u64);
+            let result = reader.try_finish();
+            if trailing {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+                let position = reader.get_ref().position();
+                assert_eq!(position, ciphertext.len() as u64 + 1);
+                assert!(reader.try_finish_frame().is_err());
+                assert!(reader.try_finish().is_err());
+                assert!(reader.read(&mut [0; 1]).is_err());
+                assert_eq!(reader.get_ref().position(), position);
+            } else {
+                result.unwrap();
+                reader.finish().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn mutable_access_invalidates_verified_eof() {
+        let ciphertext = encrypt(&test_key(), b"io", Parameters::SEGMENT_64_B, b"message").unwrap();
         let mut reader = DecryptReader::new(Cursor::new(ciphertext), &test_key(), b"io").unwrap();
         reader.try_finish().unwrap();
-
-        // When finalization is requested again, then it still succeeds
-        reader.try_finish().unwrap();
+        reader.get_mut().get_mut().push(0x42);
+        // Frame completion remains true, but the previously verified EOF is stale.
         assert!(reader.is_finished());
+        assert_eq!(
+            reader.try_finish().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(!reader.is_finished());
+        assert!(reader.try_finish().is_err());
     }
 
     #[test]
