@@ -1,6 +1,6 @@
 [package]
 name = "fast-floe"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2024"
 rust-version = "1.87"
 license = "Apache-2.0"
@@ -27,9 +27,8 @@ aws-lc-rs = ["dep:aws-lc-rs"]
 boring = ["dep:boring"]
 ring = ["dep:ring"]
 
-# 'aes-gcm' does not forward the 'zeroize' feature to its dep crates 'aes' and 'ghash'
-# so we specify them explicity and let cargo's feature unification forward 'zeroize' to them.
 [dependencies]
+# Enable zeroize directly for aes and ghash through Cargo feature unification.
 aes = { version = "0.9", optional = true, default-features = false, features = ["zeroize"] }
 aes-gcm = { version = "0.11", optional = true, default-features = false, features = ["aes", "zeroize"] }
 ghash = { version = "0.6", optional = true, default-features = false, features = ["zeroize"] }
