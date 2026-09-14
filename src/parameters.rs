@@ -64,10 +64,9 @@ pub(crate) const SEGMENT_OVERHEAD_U64: u64 = length_usize_to_u64(SEGMENT_OVERHEA
 /// specification; AES-256-GCM, HKDF-Expand-SHA-384, and the 32-byte FLOE
 /// IV are fixed.
 ///
-/// Use [`Parameters::with_segment_length`] to construct a [`Parameters`] instance with
-/// your desired segment length, or use one of the pre-made [`Parameters`] constants
-/// like [`Parameters::SEGMENT_4_KIB`] or [`Parameters::SEGMENT_1_MIB`] if convenient.
-///
+/// Construct a [`Parameters`] instance with [`Parameters::with_segment_length`],
+/// or use a constant such as [`Parameters::SEGMENT_4_KIB`] or
+/// [`Parameters::SEGMENT_1_MIB`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Parameters {
     ciphertext_segment_length: u32,
@@ -406,8 +405,8 @@ impl SegmentFraming {
 }
 
 impl Parameters {
-    /// Range of valid FLOE segment sizes in bytes. FLOE accepts _any_ segment size
-    /// in this range and is not restricted to powers of 2.
+    /// Range of valid FLOE segment sizes in bytes. FLOE accepts every segment
+    /// size in this range, not only powers of 2.
     pub const VALID_SEGMENT_LENGTHS: Range<u32> = 64..u32::MAX;
 
     /// FLOE with 64-byte encrypted segments.
@@ -431,8 +430,8 @@ impl Parameters {
     /// FLOE with 16 MiB encrypted segments.
     pub const SEGMENT_16_MIB: Self = Self::with_segment_length_unchecked(16 * 1024 * 1024);
 
-    /// Construct a [`Parameters`] instance with the provided segment length in bytes.
-    /// `segment_len` can be any value in the range [`Parameters::VALID_SEGMENT_LENGTHS`].
+    /// Constructs a [`Parameters`] instance with `segment_len` encrypted-segment
+    /// bytes. `segment_len` must lie in [`Parameters::VALID_SEGMENT_LENGTHS`].
     ///
     /// # Errors
     ///

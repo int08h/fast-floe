@@ -1,8 +1,8 @@
 //! Bounded-memory `std::io` adapters for FLOE streams.
 //!
-//! [`EncryptReader`]/[`EncryptWriter`] are the recommended encryption adapters.
-//! [`EncryptWriter`] changes [`Write::flush`] in a way that FLOE's framing makes
-//! unavoidable -- see its documentation.
+//! [`EncryptReader`] and [`EncryptWriter`] are the encryption adapters.
+//! FLOE's framing forces [`EncryptWriter`] to weaken [`Write::flush`]; see its
+//! documentation.
 //!
 //! [`DecryptReader`] decrypts a stream and, by default,
 //! requires the message to occupy the entire underlying stream; use its
@@ -17,7 +17,7 @@
 //! [`io::ErrorKind::Other`], decryption and authentication failures use
 //! [`io::ErrorKind::InvalidData`], and length violations use
 //! [`io::ErrorKind::InvalidInput`]. Use [`Error::io_source`] to recover the
-//! structured error and distinguish, say, [`Error::AuthenticationFailed`]
+//! structured error and distinguish, for example, [`Error::AuthenticationFailed`]
 //! from a failure of the wrapped reader or writer.
 
 use std::io::{self, Read, Write};
@@ -317,13 +317,12 @@ impl<W: Write> Write for EncryptWriter<W> {
 
     /// Flushes already-emitted ciphertext to the wrapped writer.
     ///
-    /// FLOE cannot emit a partial non-final segment, so buffered plaintext is
-    /// **not** written by this method. If you are done encrypting, call
+    /// FLOE cannot emit a partial non-final segment, so this method does not
+    /// write buffered plaintext. To complete the message, call
     /// [`Self::try_finish`] or [`Self::finish`] instead of `flush()`.
     ///
-    /// An `Ok(())` result does not mean that all previously written plaintext
-    /// has reached the wrapped writer — only that already-emitted ciphertext
-    /// has been flushed.
+    /// An `Ok(())` result means only that already-emitted ciphertext has been
+    /// flushed. Previously written plaintext may still be buffered.
     fn flush(&mut self) -> io::Result<()> {
         if self.status == StreamStatus::Failed {
             return Err(poisoned_error());

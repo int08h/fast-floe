@@ -90,7 +90,7 @@ fits:
 | Process a file, socket, or `std::io` adapter  | `fast_floe::io`            | `Read` or `Write`         |
 | Read selected authenticated ranges            | `fast_floe::random_access` | `Read + Seek` ciphertext  |
 | Exchange segments in order                    | `fast_floe::online`        | Streaming data            |
-| Process segments in parallel, or out of order | `fast_floe::low_level`     | Experts needing control   |
+| Process segments in parallel, or out of order | `fast_floe::low_level`     | Manual segment control    |
 
 ### Whole messages
 
@@ -136,8 +136,8 @@ assert_eq!(plaintext, b"a potentially large input");
 # }
 ```
 
-Reading `EncryptReader` to EOF completes encryption. `EncryptWriter` serves
-callers that prefer a `Write` interface.
+Reading `EncryptReader` to EOF completes encryption. Use `EncryptWriter` for
+a `Write` interface.
 
 `DecryptReader::finish` authenticates the unread ciphertext and rejects
 trailing bytes. When non-FLOE data comes after the FLOE message, use
@@ -185,9 +185,9 @@ underlying source must not change while the reader is in use. Use
 ### Segment-oriented processing
 
 Use `online::Encryptor` and `online::Decryptor` when your transport already
-deals in packets, buffers or similar units. Both process segments strictly
-in order, so the transport must preserve segment order; for out-of-order or
-parallel segment processing, use `fast_floe::low_level`.
+carries packets, buffers, or similar units. Both process segments in order,
+so the transport must preserve segment order. For out-of-order or parallel
+segment processing, use `fast_floe::low_level`.
 
 ```rust
 use std::io::{Cursor, Read};
@@ -280,9 +280,9 @@ each worker or thread. `SharedEncryptionContext` and
 `SharedDecryptionContext` are thread-safe (`Send + Sync`).
 
 The low-level API leaves every FLOE invariant to the caller: process each
-position once, produce exactly one final segment, leave no gaps and process
+position once, produce exactly one final segment, leave no gaps, and process
 nothing after the final segment. Breaking these rules can break the security
-of the message, so prefer the misuse-resistant higher-level APIs.
+of the message. Use the higher-level APIs unless you need this control.
 
 `low_level::SegmentBuffer` provides reusable in-place storage. Callers that
 manage their own allocation can use the `*_raw` methods with their own
