@@ -885,7 +885,7 @@ mod tests {
             plaintext[segment_length..2 * segment_length]
         );
 
-        // When the wrapped reader is repositioned behind the reader's back
+        // When the wrapped reader is repositioned through get_mut
         reader.get_mut().seek(SeekFrom::Start(0)).unwrap();
 
         // Then subsequent segment reads reposition explicitly and still

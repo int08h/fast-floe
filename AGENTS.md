@@ -18,15 +18,15 @@ Most unit and interoperability tests live in `src/tests.rs`, with focused module
 
 ## Coding Style & Naming Conventions
 
-Use four-space rustfmt formatting and idiomatic Rust naming: `snake_case` for functions/modules, `PascalCase` for types, and `SCREAMING_SNAKE_CASE` for constants. The crate forbids unsafe code and enables Clippy's `all` and `pedantic` groups. Keep common workflows in safe, high-level APIs; place sharp primitives behind `low_level`. Document public behavior, error cases, and framing/finalization obligations.
+Use four-space rustfmt formatting and idiomatic Rust naming: `snake_case` for functions/modules, `PascalCase` for types, and `SCREAMING_SNAKE_CASE` for constants. The crate forbids unsafe code and enables Clippy's `all` and `pedantic` groups. Keep common workflows in safe, high-level APIs; place primitives that require caller-enforced invariants behind `low_level`. Document public behavior, error cases, and framing/finalization obligations.
 
 ## Testing Guidelines
 
-Name tests after observable behavior, such as `every_truncation_of_valid_ciphertext_rejected`. Add focused regression tests for boundary lengths, authentication failures, final segments, and provider interoperability. Do not update KATs merely to make a test pass; wire-format changes must remain specification-compatible. Run the default suite, relevant single-provider configurations, and doctests before submitting. Compile each provider one at a time (do not use --all-features) when benchmarking.
+Name tests after observable behavior, such as `every_truncation_of_valid_ciphertext_rejected`. Add focused regression tests for boundary lengths, authentication failures, final segments, and provider interoperability. Do not update KATs to make a test pass; wire-format changes must remain specification-compatible. Run the default suite, relevant single-provider configurations, and doctests before submitting. Compile each provider one at a time (do not use --all-features) when benchmarking.
 
 ## Commit & Pull Request Guidelines
 
-History favors short, imperative summaries such as `Support additive encryption providers` or `Refresh README`. Keep each commit focused and include tests with behavioral changes. Pull requests should briefly explain the caller-visible effect and include before/after Criterion results for performance-sensitive changes. Never add a "Co-Authored-By" line to commits.
+Write short, imperative commit summaries such as `Support additive encryption providers` or `Refresh README`. Keep each commit focused and include tests with behavioral changes. Pull requests should briefly explain the caller-visible effect and include before/after Criterion results for performance-sensitive changes. Never add a "Co-Authored-By" line to commits.
 
 ## Communication
 

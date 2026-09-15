@@ -166,7 +166,7 @@ fn ambiguous_keys_fail_from_every_entry_layer() {
 #[test]
 fn every_kat_decrypts() {
     // Given the vendored known-answer vectors; a published crate omits
-    // them, which is tolerated only outside a repository checkout
+    // them, so they may be absent only outside a repository checkout
     let manifest_directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let kat_directory = manifest_directory.join("kats");
     if !kat_directory.exists() {

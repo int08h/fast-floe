@@ -68,7 +68,7 @@ impl Key {
         }
     }
 
-    /// Returns the raw secret key bytes. Handle with care.
+    /// Returns the raw secret key bytes. Do not log or expose them.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; Self::LEN] {
         &self.bytes

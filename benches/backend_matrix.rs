@@ -273,8 +273,8 @@ fn benchmark_encryption(
     in_place_group.throughput(Throughput::Bytes(plaintext.len() as u64));
     // One contiguous arena holds every segment slot at its final message
     // offset, so FLOE and the bare-AEAD baseline traverse identically shaped
-    // memory. A fleet of per-segment heap buffers instead measures allocator
-    // placement: in earlier runs the same FLOE code swung between 11 and 20
+    // memory. Separate per-segment heap buffers measure allocator placement
+    // instead: in earlier runs the same FLOE code swung between 11 and 20
     // GiB/s depending on which allocations the arena recycled. The arena is
     // refilled, not reallocated, between iterations because Criterion's
     // warm-up estimate counts untimed setup wall-clock.

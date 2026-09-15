@@ -682,8 +682,8 @@ impl EncryptionState {
                 buffer.ciphertext()
             }
             Err(error) => {
-                // Zeroize rather than merely discard: the buffer still holds
-                // the plaintext that failed to encrypt.
+                // Zeroize, do not just discard: the buffer still holds the
+                // plaintext that failed to encrypt.
                 buffer.clear();
                 Err(error)
             }

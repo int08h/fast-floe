@@ -1,8 +1,7 @@
 # Provider feature-unification fixture
 
 This workspace has two libraries enabling different FLOE providers in one
-application dependency graph. Cargo must successfully unify both provider 
-features.
+application dependency graph. Cargo must unify both provider features.
 
 Run it from the repository root:
 

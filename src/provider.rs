@@ -1,6 +1,6 @@
 /// A compiled-in cryptographic backend: an AEAD, KDF, and RNG bundle.
 ///
-/// When exactly one backend is compiled in, everything "just works" transparently.
+/// When exactly one backend is compiled in, the crate uses it automatically.
 ///
 /// When a build contains multiple providers, bind one explicitly to
 /// a [`crate::Key`] with [`crate::Key::from_bytes_with_provider`] or
@@ -51,7 +51,7 @@ impl Provider {
 
     /// Returns the build's default provider when exactly one provider was compiled.
     ///
-    /// Multi-provider builds deliberately have no default.
+    /// Multi-provider builds have no default.
     #[must_use]
     pub const fn build_default() -> Option<Self> {
         if Self::COMPILED.len() == 1 {
